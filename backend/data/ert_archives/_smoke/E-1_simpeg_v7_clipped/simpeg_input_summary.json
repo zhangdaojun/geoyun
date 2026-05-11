@@ -1,0 +1,9 @@
+{
+  "format": "geoyun.simpeg.ert2d.input.v1",
+  "csv": "backend\\data\\ert_archives\\_smoke\\E-1_simpeg_v7_clipped\\simpeg_input_abmn.csv",
+  "data_type": "apparent_resistivity",
+  "observation_count": 287,
+  "coordinate_columns": "2D SimPEG x,z electrode coordinates from RES2DINV ABMN",
+  "dobs_units": "ohm-m",
+  "standard_deviation_units": "same as dobs"
+}

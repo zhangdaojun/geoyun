@@ -1,0 +1,1 @@
+{"output_dir": "backend\\data\\ert_archives\\_smoke\\E-1_simpeg_v6_widebound", "data_file_path": "backend\\data\\ert_archives\\_smoke\\E-1_simpeg_v6_widebound\\input_data.dat", "data_file_name": "E-1.dat", "terrain_file_path": null, "terrain_file_name": null, "inversion_backend": "simpeg", "z_weight": 0.2, "max_iter": 25, "lambda_param": 20, "error": 0.03}

@@ -1,0 +1,33 @@
+{
+  "backend": "simpeg",
+  "input_format": "RES2DINV DAT -> SimPEG 2D DC apparent_resistivity survey",
+  "input_audit_csv": "backend\\data\\ert_archives\\_smoke\\E-1_simpeg_v5\\simpeg_input_abmn.csv",
+  "input_audit_summary": "backend\\data\\ert_archives\\_smoke\\E-1_simpeg_v5\\simpeg_input_summary.json",
+  "array_name": "wenner",
+  "source_data_count": 287,
+  "used_data_count": 287,
+  "source_count": 287,
+  "mesh_cells": 1953,
+  "mesh_shape": [
+    63,
+    31
+  ],
+  "mesh_origin": [
+    -736.9671549324115,
+    137.00974506758814
+  ],
+  "solver": "MUMPS",
+  "background_resistivity_ohm_m": 65.54,
+  "resistivity_lower_bound_ohm_m": 7.9455,
+  "resistivity_upper_bound_ohm_m": 439.0463999999996,
+  "phi_d": 3520.2336121329977,
+  "target_phi_d": 287.0,
+  "normalized_residual_rms": 3.5022310520476547,
+  "weighted_rms": 3.5022310520476547,
+  "relative_rrms_percent": 10.522798373548934,
+  "mean_absolute_percent_error": 7.851028631843482,
+  "resistivity_min_ohm_m": 7.945500000000001,
+  "resistivity_median_ohm_m": 65.54305786049822,
+  "resistivity_max_ohm_m": 439.0463999999997,
+  "output_npz": "backend\\data\\ert_archives\\_smoke\\E-1_simpeg_v5\\simpeg_ert_inversion.npz"
+}
