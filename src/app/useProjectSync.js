@@ -1,10 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { projectsData } from '../mockData';
 import { canManageProjectDatabase } from '../utils/accessControl';
 import { ensureProjectShape } from '../utils/projectModel';
 import { confirmDialog } from '../utils/message';
-import { canLogAdminFileOperations, fetchAdminFiles } from '../services/adminFileApi';
-import { canUseAdminFoldersApi, fetchAdminFolders } from '../services/adminFolderApi';
 import {
   canEditAdminProjectsApi,
   canUseAdminProjectsApi,
@@ -16,110 +13,21 @@ import {
   updateAdminProjectViaApi
 } from '../services/adminProjectApi';
 
-const mergeDriveItems = (localItems = [], folderItems = [], fileItems = []) => {
-  const normalizedLocalItems = Array.isArray(localItems) ? localItems : [];
-  const remoteFolderByExternalId = new Map(
-    (Array.isArray(folderItems) ? folderItems : [])
-      .filter((item) => item?.id)
-      .map((item) => [String(item.id), item])
-  );
-  const remoteFileByExternalId = new Map(
-    (Array.isArray(fileItems) ? fileItems : [])
-      .filter((item) => item?.id)
-      .map((item) => [String(item.id), item])
-  );
+const PROJECT_SYNC_TIMEOUT_MS = 20000;
 
-  const mergeDriveFileItem = (localItem = {}, remoteItem = {}) => {
-    const merged = {
-      ...localItem,
-      ...remoteItem
-    };
-    const localPersistedBlobId = localItem.persistedBlobId || localItem.persisted_blob_id;
-    const remotePersistedBlobId = remoteItem.persistedBlobId || remoteItem.persisted_blob_id;
-    if (!remotePersistedBlobId && localPersistedBlobId) {
-      merged.persistedBlobId = localPersistedBlobId;
-      merged.persisted_blob_id = localPersistedBlobId;
-    }
-
-    const localObjectKey = localItem.object_key || localItem.objectKey;
-    const remoteObjectKey = remoteItem.object_key || remoteItem.objectKey;
-    if (!remoteObjectKey && localObjectKey) {
-      merged.object_key = localObjectKey;
-      merged.objectKey = localObjectKey;
-    }
-
-    const remoteStorageProvider = remoteItem.storage_provider || remoteItem.storageProvider;
-    if (localPersistedBlobId && remoteStorageProvider === 'oss' && !remoteObjectKey) {
-      merged.storage_provider = localItem.storage_provider || localItem.storageProvider || 'indexeddb';
-      merged.storageProvider = merged.storage_provider;
-    }
-
-    return merged;
-  };
-
-  const mergedItems = normalizedLocalItems.map((item) => {
-    if (item?.type === 'folder') {
-      const matchedFolderItem = remoteFolderByExternalId.get(String(item.id));
-      if (!matchedFolderItem) return item;
-      remoteFolderByExternalId.delete(String(item.id));
-      return {
-        ...item,
-        ...matchedFolderItem
-      };
-    }
-
-    if (item?.type !== 'file') return item;
-
-    const candidateIds = [item.id]
-      .filter(Boolean)
-      .map((value) => String(value));
-    const matchedRemoteItem = candidateIds
-      .map((candidateId) => remoteFileByExternalId.get(candidateId))
-      .find(Boolean);
-
-    if (!matchedRemoteItem) return item;
-
-    remoteFileByExternalId.delete(String(matchedRemoteItem.id));
-    return mergeDriveFileItem(item, matchedRemoteItem);
+const withProjectSyncTimeout = (promise, label = '项目同步') => {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = window.setTimeout(() => {
+      reject(new Error(`${label}超时，请稍后刷新确认结果。`));
+    }, PROJECT_SYNC_TIMEOUT_MS);
   });
-
-  remoteFolderByExternalId.forEach((item) => mergedItems.push(item));
-  remoteFileByExternalId.forEach((item) => mergedItems.push(item));
-  return mergedItems;
-};
-
-const hydrateAdminProjectDriveItems = async (project, currentUser) => {
-  if (!project?.backendProjectId || !canUseAdminProjectsApi(currentUser)) {
-    return ensureProjectShape(project);
-  }
-
-  const shouldLoadFolders = canUseAdminFoldersApi(currentUser, project);
-  const shouldLoadFiles = canLogAdminFileOperations(currentUser, project);
-  if (!shouldLoadFolders && !shouldLoadFiles) {
-    return ensureProjectShape(project);
-  }
-
-  const [folderResult, fileResult] = await Promise.allSettled([
-    shouldLoadFolders
-      ? fetchAdminFolders({ projectId: project.backendProjectId, status: 'active' }, currentUser)
-      : Promise.resolve({ items: [] }),
-    shouldLoadFiles
-      ? fetchAdminFiles({ projectId: project.backendProjectId, status: 'active' }, currentUser)
-      : Promise.resolve({ items: [] })
-  ]);
-
-  const folderItems = folderResult.status === 'fulfilled' ? (folderResult.value?.items || []) : [];
-  const fileItems = fileResult.status === 'fulfilled' ? (fileResult.value?.items || []) : [];
-
-  return ensureProjectShape({
-    ...project,
-    cloudData: {
-      ...(project.cloudData || {}),
-      projectId: project.id,
-      items: mergeDriveItems(project?.cloudData?.items || [], folderItems, fileItems)
-    }
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    window.clearTimeout(timeoutId);
   });
 };
+
+const hydrateAdminProjectDriveItems = async (project) => ensureProjectShape(project);
 
 export const useProjectSync = ({
   persistedState,
@@ -131,7 +39,9 @@ export const useProjectSync = ({
   setPendingProjectSelection
 }) => {
   const [projectsList, setProjectsList] = useState(() => (
-    persistedState?.projectsList || projectsData.map(ensureProjectShape)
+    Array.isArray(persistedState?.projectsList)
+      ? persistedState.projectsList
+      : []
   ));
   const [projectSyncStatus, setProjectSyncStatus] = useState(null);
   const projectUpdateQueueRef = useRef(Promise.resolve());
@@ -203,10 +113,10 @@ export const useProjectSync = ({
           && resolvedBackendProjectId;
         const shouldUseAdminCreateApi = canUseProjectAdminApi
           && (!resolvedBackendProjectId || resolvedDataSource !== 'fastapi-admin');
-        const savedProject = shouldUseAdminUpdateApi
-          ? await updateAdminProjectViaApi(normalizedProject, currentUser)
+        const saveProjectPromise = shouldUseAdminUpdateApi
+          ? updateAdminProjectViaApi(normalizedProject, currentUser)
           : shouldUseAdminCreateApi
-            ? await (async () => {
+            ? (async () => {
                 const existingAdminProject = await findAdminProjectByExternalId(normalizedProject.id, currentUser);
                 if (existingAdminProject?.backendProjectId) {
                   return updateAdminProjectViaApi(
@@ -224,7 +134,13 @@ export const useProjectSync = ({
             : (() => {
                 throw new Error('当前账号无权同步项目到 FastAPI 后端');
               })();
-        const refreshedProject = await refetchProjectDetail(savedProject).catch(() => savedProject);
+        const savedProject = await withProjectSyncTimeout(saveProjectPromise, syncMeta.syncTitle || '项目同步');
+        const refreshedProject = syncMeta?.skipRefetch
+          ? ensureProjectShape(savedProject)
+          : await withProjectSyncTimeout(
+              refetchProjectDetail(savedProject).catch(() => savedProject),
+              '项目详情回刷'
+            );
         setProjectsList((prev) => {
           const normalizedSavedProject = ensureProjectShape(refreshedProject);
           const exists = prev.some((project) => project.id === normalizedSavedProject.id);
@@ -262,6 +178,37 @@ export const useProjectSync = ({
     });
     return queuedUpdate;
   };
+
+  useEffect(() => {
+    if (projectSyncStatus?.phase !== 'syncing') return undefined;
+    const startedAt = Number(projectSyncStatus.updatedAt || Date.now());
+    const delay = Math.max(PROJECT_SYNC_TIMEOUT_MS - (Date.now() - startedAt), 0);
+    const timeoutId = window.setTimeout(() => {
+      setProjectSyncStatus((current) => {
+        if (current?.phase !== 'syncing') return current;
+        if (current.updatedAt !== projectSyncStatus.updatedAt) return current;
+        return {
+          ...current,
+          phase: 'error',
+          title: `${current.title || '项目同步'}超时`,
+          detail: '后台同步时间过长，已停止等待。请刷新页面确认最新结果。',
+          updatedAt: Date.now()
+        };
+      });
+    }, delay);
+    return () => window.clearTimeout(timeoutId);
+  }, [projectSyncStatus]);
+
+  useEffect(() => {
+    if (!['success', 'error'].includes(projectSyncStatus?.phase)) return undefined;
+    const snapshotUpdatedAt = projectSyncStatus?.updatedAt;
+    const timer = window.setTimeout(() => {
+      setProjectSyncStatus((current) => (
+        current?.updatedAt === snapshotUpdatedAt ? null : current
+      ));
+    }, 4000);
+    return () => window.clearTimeout(timer);
+  }, [projectSyncStatus]);
 
   const handleDeleteProjectApi = async (projectToDelete) => {
     if (!projectToDelete?.id) return;

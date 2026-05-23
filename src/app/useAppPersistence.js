@@ -5,9 +5,7 @@ export const useAppPersistence = ({
   appSettings,
   currentUser,
   currentView,
-  isAuthenticated,
   pendingDriveFolderId,
-  projectsList,
   selectedProject,
   users
 }) => {
@@ -21,7 +19,7 @@ export const useAppPersistence = ({
           currentView,
           selectedProjectId: selectedProject?.id || null,
           pendingDriveFolderId,
-          projectsList: serializeProjectsForStorage(projectsList),
+          projectsList: serializeProjectsForStorage(),
           appSettings,
           users,
           currentUser
@@ -33,5 +31,5 @@ export const useAppPersistence = ({
     return () => {
       if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
     };
-  }, [appSettings, currentUser, currentView, isAuthenticated, pendingDriveFolderId, projectsList, selectedProject, users]);
+  }, [appSettings, currentUser, currentView, pendingDriveFolderId, selectedProject, users]);
 };

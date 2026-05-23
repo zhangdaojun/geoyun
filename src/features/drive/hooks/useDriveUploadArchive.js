@@ -1,7 +1,7 @@
 import { resolveFolderIdByTaskName, resolveTaskByFolderId } from '../../../utils/projectModel';
 import { choiceDialog, msg } from '../../../utils/message';
 import { formatFileSizeBytes } from '../../../utils/fileUtils';
-import { getOssUploadPolicy, uploadFileToOss } from '../../../services/ossApi';
+import { getOssUploadPolicies, getOssUploadPolicy, uploadFileToOss } from '../../../services/ossApi';
 import {
   classifyFileInstrument,
   formatInstrumentLabel,
@@ -51,8 +51,12 @@ export const useDriveUploadArchive = ({
     const rejectedFiles = [];
     const uploadedExcelCount = files.filter(file => isExcelWorkbookFile(file.name)).length;
     const totalBytes = files.reduce((sum, file) => sum + (Number(file.size) || 0), 0);
+    const pendingPersistItems = [];
+    const pendingReplaceIds = new Set();
+    const pendingOperations = [];
     const uploadController = new AbortController();
     const uploadSignal = uploadController.signal;
+    const policyQueue = [];
     let completedBytes = 0;
     let completedCount = 0;
     let failedCount = 0;
@@ -145,6 +149,7 @@ export const useDriveUploadArchive = ({
       const validItems = items.filter(Boolean);
       if (!validItems.length) return { ok: true };
       const replaceIds = new Set(options.replaceIds || []);
+      const operations = (options.operations || []).filter(Boolean);
 
       updateUploadProgress({
         currentFile: validItems[0]?.name || '',
@@ -186,16 +191,9 @@ export const useDriveUploadArchive = ({
         errorTitle: '上传结果同步失败'
       });
 
-      const syncResult = await logFileOperations(
-        validItems.map((item) => buildFileOperationPayload(
-          item,
-          'upload',
-          {
-            source: 'data-drive',
-            duplicate_action: replaceIds.has(item.id) ? 'overwrite' : 'create',
-          },
-        ))
-      );
+      const syncResult = operations.length
+        ? await logFileOperations(operations)
+        : { ok: true, total: validItems.length };
 
       if (syncResult && !syncResult.ok) {
         setBackendFeedback({
@@ -205,7 +203,6 @@ export const useDriveUploadArchive = ({
         });
       }
 
-      syncDriveItemsSnapshot(validItems, replaceIds);
       return syncResult || { ok: true, total: validItems.length };
     };
 
@@ -220,6 +217,21 @@ export const useDriveUploadArchive = ({
     const loadingMessage = msg.loading(`开始上传 ${files.length} 个文件至 OSS...`, 0);
 
     try {
+      try {
+        updateUploadProgress({
+          currentFile: files[0]?.name || '',
+          currentIndex: files.length > 0 ? 1 : 0,
+          status: 'policy'
+        });
+        const batchPolicyPayload = await getOssUploadPolicies(
+          selectedProject?.id || 0,
+          files.map((file) => file.name)
+        );
+        policyQueue.push(...((batchPolicyPayload?.items || []).map((item) => item?.policy).filter(Boolean)));
+      } catch (error) {
+        console.warn('Failed to preload OSS upload policies; falling back to per-file policy requests.', error);
+      }
+
       for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
         if (uploadSignal.aborted) {
           uploadStopped = true;
@@ -281,8 +293,11 @@ export const useDriveUploadArchive = ({
 
         let policyData;
         try {
-          updateUploadProgress({ status: 'policy' });
-          policyData = await getOssUploadPolicy(selectedProject?.id || 0, file.name);
+          policyData = policyQueue[fileIndex];
+          if (!policyData) {
+            updateUploadProgress({ status: 'policy' });
+            policyData = await getOssUploadPolicy(selectedProject?.id || 0, file.name);
+          }
           if (uploadSignal.aborted) {
             uploadStopped = true;
             break;
@@ -372,26 +387,47 @@ export const useDriveUploadArchive = ({
           : null;
 
         const itemsToPersist = [fileItem, designCopyItem].filter(Boolean);
+        const replaceIdsForFile = shouldOverwriteExisting ? [existingFile.id] : [];
+        const operationsToPersist = itemsToPersist
+          .map((item) => buildFileOperationPayload(
+            item,
+            'upload',
+            {
+              source: 'data-drive',
+              duplicate_action: replaceIdsForFile.includes(item.id)
+                ? 'overwrite'
+                : (item.linkedSourceFileId ? 'mirror-copy' : 'create'),
+            },
+          ))
+          .filter(Boolean);
 
-        try {
-          await persistUploadedItems(itemsToPersist, currentIndex, {
-            replaceIds: shouldOverwriteExisting ? [existingFile.id] : [],
-          });
-          uploadedFileItems.push(...itemsToPersist);
-          newFiles.push(...itemsToPersist);
-        } catch (err) {
-          setBackendFeedback({
-            level: 'warning',
-            title: '网盘文件写入失败',
-            detail: `${file.name} 已上传到 OSS，但写入网盘或后台记录失败：${err.message || '未知错误'}`
-          });
-        }
+        pendingPersistItems.push(...itemsToPersist);
+        replaceIdsForFile.forEach((id) => pendingReplaceIds.add(id));
+        pendingOperations.push(...operationsToPersist);
+        syncDriveItemsSnapshot(itemsToPersist, new Set(replaceIdsForFile));
       }
     } finally {
       if (uploadAbortControllerRef?.current === uploadController) {
         uploadAbortControllerRef.current = null;
       }
       loadingMessage();
+    }
+
+    if (pendingPersistItems.length) {
+      try {
+        await persistUploadedItems(pendingPersistItems, files.length, {
+          replaceIds: Array.from(pendingReplaceIds),
+          operations: pendingOperations
+        });
+        uploadedFileItems.push(...pendingPersistItems);
+        newFiles.push(...pendingPersistItems);
+      } catch (err) {
+        setBackendFeedback({
+          level: 'warning',
+          title: '网盘文件写入失败',
+          detail: `已有文件上传到 OSS，但批量写入网盘或后台记录失败：${err.message || '未知错误'}`
+        });
+      }
     }
 
     if (uploadedExcelCount > 0 && newFiles.length > 0) {
@@ -410,8 +446,8 @@ export const useDriveUploadArchive = ({
     } else if (uploadedFileItems.length > 0) {
       setBackendFeedback({
         level: 'success',
-        title: '后台文件记录已逐个同步',
-        detail: `已随上传进度将 ${uploadedFileItems.length} 个文件写入后台 files/file_operation_logs。`
+        title: '后台文件记录已批量同步',
+        detail: `已将 ${uploadedFileItems.length} 个文件统一写入后台 files/file_operation_logs。`
       });
     }
 

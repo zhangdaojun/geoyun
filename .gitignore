@@ -34,6 +34,7 @@ _batch_*.cjs
 # Database files
 *.sqlite3
 server/data/geoyun-db.json
+dump.rdb
 
 # Python
 __pycache__
@@ -83,4 +84,5 @@ Thumbs.db
 .vercel/
 
 # Claude Code local settings
+.claude/
 .claude/settings.local.json

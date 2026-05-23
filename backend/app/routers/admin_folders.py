@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..deps import can_manage_project, get_current_admin_user
-from ..models import FileRecord, FolderRecord, Project, User
+from ..models import FileOperationLog, FileRecord, FolderRecord, Project, User
 from ..schemas import FolderRecordListResponse, FolderRecordOut, FolderWriteIn
 
 router = APIRouter(prefix="/admin/folders", tags=["admin-folders"])
@@ -130,6 +131,7 @@ def update_folder(
 def delete_folder(
     external_folder_id: str,
     project_id: int = Query(alias="projectId"),
+    request: Request = None,
     db: Session = Depends(get_db),
     admin_user: User = Depends(get_current_admin_user),
 ):
@@ -177,6 +179,22 @@ def delete_folder(
         parent_id = (file_record.metadata_json or {}).get("parent_id")
         if parent_id in folder_ids_to_delete:
             file_record.status = "deleted"
+            file_record.deleted_at = file_record.deleted_at or datetime.utcnow()
+            db.add(
+                FileOperationLog(
+                    file_id=file_record.id,
+                    operator_id=admin_user.id,
+                    operation_type="delete",
+                    result="success",
+                    ip_address=request.client.host if request and request.client else None,
+                    user_agent=request.headers.get("user-agent") if request else None,
+                    extra_data={
+                        "source": "admin-folder-delete",
+                        "external_folder_id": external_folder_id,
+                        "deleted_folder_ids": sorted(folder_ids_to_delete),
+                    },
+                )
+            )
 
     for folder in folders:
         if folder.external_folder_id in folder_ids_to_delete:

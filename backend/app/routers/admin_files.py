@@ -369,7 +369,6 @@ def list_files(
         query = query.filter(FileRecord.external_file_id == external_file_id)
 
     records = query.limit(limit).all()
-    _hydrate_oss_file_sizes(db, records)
     return FileRecordListResponse(
         items=[_serialize_file_record(record) for record in records],
         total=len(records),
@@ -393,13 +392,19 @@ def update_file_record(
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
 
+    next_storage_provider = str(payload.storage_provider or record.storage_provider or "oss").strip() or "oss"
+    next_object_key = (
+        _require_oss_object_key(payload.object_key or record.object_key)
+        if next_storage_provider == "oss"
+        else str(payload.object_key or payload.file_url or record.object_key or record.external_file_id or "").strip()
+    )
     metadata_json = dict(record.metadata_json or {})
     metadata_json.update(
         {
             "item_type": payload.item_type or metadata_json.get("item_type", "file"),
             "parent_id": payload.parent_id,
-            "storage_provider": "oss",
-            "object_key": payload.object_key or record.object_key,
+            "storage_provider": next_storage_provider,
+            "object_key": next_object_key,
             **(payload.extra_data or {}),
         }
     )
@@ -413,14 +418,13 @@ def update_file_record(
     record.status = payload.status or record.status
     record.version_no = max(int(payload.version_no or record.version_no or 1), 1)
     record.storage_class = payload.storage_class or record.storage_class
-    record.storage_provider = "oss"
-    record.bucket_name = payload.bucket_name or record.bucket_name or "geoyun"
-    if payload.object_key:
-        record.object_key = payload.object_key
-    elif not record.object_key:
-        record.object_key = _require_oss_object_key(payload.object_key)
+    record.storage_provider = next_storage_provider
+    record.bucket_name = payload.bucket_name or record.bucket_name or ("geoyun" if next_storage_provider == "oss" else next_storage_provider)
+    record.object_key = next_object_key
     record.metadata_json = metadata_json
-    if record.status != "deleted":
+    if record.status == "deleted":
+        record.deleted_at = record.deleted_at or datetime.utcnow()
+    else:
         record.deleted_at = None
 
     db.commit()

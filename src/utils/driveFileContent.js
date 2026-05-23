@@ -80,7 +80,7 @@ export const fetchDriveFileUrl = async (fileUrl, fallbackName = 'data.bin') => {
 
 export const fetchLocalErtInputFile = async (fileName = 'data.dat') => {
   const safeName = String(fileName || 'data.dat').split(/[\\/]/).pop();
-  if (!/\.(dat|shm|txt|csv|xyz)$/i.test(safeName)) return null;
+  if (!/\.(dat|shm|txt|csv|xyz|npz)$/i.test(safeName)) return null;
   const token = getToken();
   const response = await fetch(`/admin/ert/local-input-files/${encodeURIComponent(safeName)}`, {
     credentials: 'include',

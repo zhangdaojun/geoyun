@@ -113,6 +113,17 @@ const readVtkNumericBlock = (lines, startIndex, expectedCount) => {
   return { values: values.slice(0, expectedCount), nextIndex: index };
 };
 
+const readBrowserFileText = async (file) => {
+  if (!file) return '';
+  if (typeof file.text === 'function') return file.text();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (event) => resolve(String(event.target?.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('FileReader error'));
+    reader.readAsText(file);
+  });
+};
+
 const parseAsciiVtkResistivity = (text) => {
   if (!/^#\s*vtk\b/im.test(text) || !/\bDATASET\s+UNSTRUCTURED_GRID\b/i.test(text)) {
     return null;
@@ -178,20 +189,43 @@ const parseAsciiVtkResistivity = (text) => {
   if (!points.length || !cells.length || !resistivityValues?.length) return null;
 
   const finitePointXs = points.map((point) => point[0]).filter(Number.isFinite);
-  const finitePointYs = points.map((point) => point[1]).filter(Number.isFinite);
   const positiveMaxX = finitePointXs.filter((value) => value >= 0).reduce((max, value) => Math.max(max, value), 0);
   const shouldClipNegativePadding = positiveMaxX > 0 && finitePointXs.some((value) => value < 0);
 
   const parsed = [];
   const nodeAccum = new Map();
+  const gridCells = [];
+  const meshCells = [];
   cells.forEach((cell, cellIndex) => {
     const rho = Number(resistivityValues[cellIndex]);
     const vertices = cell.map((pointIndex) => points[pointIndex]).filter(Boolean);
     if (!vertices.length || !Number.isFinite(rho) || rho <= 0) return;
-    const x = vertices.reduce((sum, point) => sum + point[0], 0) / vertices.length;
-    const elevation = vertices.reduce((sum, point) => sum + point[1], 0) / vertices.length;
+    const vertexXs = vertices.map((point) => point[0]).filter(Number.isFinite);
+    const vertexYs = vertices.map((point) => point[1]).filter(Number.isFinite);
+    if (!vertexXs.length || !vertexYs.length) return;
+    const minX = Math.min(...vertexXs);
+    const maxX = Math.max(...vertexXs);
+    const minY = Math.min(...vertexYs);
+    const maxY = Math.max(...vertexYs);
+    const x = (minX + maxX) / 2;
+    const elevation = (minY + maxY) / 2;
     if (!Number.isFinite(x) || !Number.isFinite(elevation)) return;
     if (shouldClipNegativePadding && x < 0) return;
+    const uniqueVertexXCount = new Set(vertexXs.map((value) => Number(value.toFixed(9)))).size;
+    const uniqueVertexYCount = new Set(vertexYs.map((value) => Number(value.toFixed(9)))).size;
+    if (vertices.length === 4 && uniqueVertexXCount === 2 && uniqueVertexYCount === 2 && maxX > minX && maxY > minY) {
+      const clippedMinX = shouldClipNegativePadding ? Math.max(0, minX) : minX;
+      if (maxX > clippedMinX) {
+        gridCells.push([clippedMinX, minY, maxX - clippedMinX, maxY - minY, rho]);
+      }
+    }
+    const polygon = vertices
+      .map((point) => [point[0], point[1]])
+      .filter(([px, py]) => Number.isFinite(px) && Number.isFinite(py))
+      .map(([px, py]) => [shouldClipNegativePadding ? Math.max(0, px) : px, py]);
+    if (polygon.length >= 3) {
+      meshCells.push({ points: polygon, rho });
+    }
     parsed.push([x, elevation, rho]);
     cell.forEach((pointIndex) => {
       const point = points[pointIndex];
@@ -212,7 +246,26 @@ const parseAsciiVtkResistivity = (text) => {
     .sort((a, b) => (a[1] - b[1]) || (a[0] - b[0]));
 
   return {
-    points: nodePoints.length ? nodePoints : parsed,
+    points: parsed.length ? parsed : nodePoints,
+    cellGrid: gridCells.length ? {
+      cells: gridCells,
+      bounds: {
+        xMin: Math.min(...gridCells.map((cell) => cell[0])),
+        xMax: Math.max(...gridCells.map((cell) => cell[0] + cell[2])),
+        yMin: Math.min(...gridCells.map((cell) => cell[1])),
+        yMax: Math.max(...gridCells.map((cell) => cell[1] + cell[3])),
+      },
+      boundary: []
+    } : null,
+    mesh: meshCells.length ? {
+      cells: meshCells,
+      bounds: {
+        xMin: Math.min(...meshCells.flatMap((cell) => cell.points.map((point) => point[0]))),
+        xMax: Math.max(...meshCells.flatMap((cell) => cell.points.map((point) => point[0]))),
+        yMin: Math.min(...meshCells.flatMap((cell) => cell.points.map((point) => point[1]))),
+        yMax: Math.max(...meshCells.flatMap((cell) => cell.points.map((point) => point[1]))),
+      }
+    } : null,
     spacing: positiveMaxX > 0 ? positiveMaxX / 7 : null,
     electrodeCount: positiveMaxX > 0 ? 8 : null,
     profileLength: positiveMaxX > 0 ? positiveMaxX : null,
@@ -237,6 +290,7 @@ const ERTParser = ({
   const [customColors, setCustomColors] = useState(DEFAULT_CUSTOM);
   const chartRef = useRef(null);
   const chartRef2 = useRef(null);
+  const fitChartRef = useRef(null);
   const [chartReadyTick, setChartReadyTick] = useState(0);
   const dataPointsRef = useRef([]);
   const [displayMode, setDisplayMode] = useState('heatmap'); // 'heatmap' | 'wiggle'
@@ -248,6 +302,8 @@ const ERTParser = ({
   const [fileElectrodeCount, setFileElectrodeCount] = useState(null);
   const [fileProfileLength, setFileProfileLength] = useState(null);
   const [topographyData, setTopographyData] = useState(null);
+  const [directVtkCellGrid, setDirectVtkCellGrid] = useState(null);
+  const [directVtkMesh, setDirectVtkMesh] = useState(null);
   const [editingCell, setEditingCell] = useState(null); // { rowIndex, colIndex }
   const [showTable, setShowTable] = useState(false); // 是否显示右侧表格
   const tableRef = useRef(null);
@@ -279,6 +335,7 @@ const ERTParser = ({
   const [activeInversionTask, setActiveInversionTask] = useState(null);
   const inversionTaskPollRef = useRef(null);
   const handledInversionTaskIdsRef = useRef(new Set());
+  const restoredArchiveKeyRef = useRef('');
 
   const selectedInversionRun = React.useMemo(() => (
     inversionRuns.find((run) => run.id === selectedInversionRunId) || inversionRuns[inversionRuns.length - 1] || null
@@ -288,6 +345,8 @@ const ERTParser = ({
     return (selectedInversionRun.iterations || []).find((item) => item.key === selectedInversionIterationKey) || null;
   }, [selectedInversionRun, selectedInversionIterationKey]);
   const inversionResult = selectedInversionIteration?.data || selectedInversionRun?.data || null;
+  const currentFitComparison = selectedInversionIteration?.files?.fit_comparison || selectedInversionRun?.result?.fit_comparison || null;
+  const isDirectVtkFile = /\.(vtk)$/i.test(String(fileObj?.name || '').trim());
 
   // 获取当前生效的数据点（原始视电阻率或反演结果）
   const activeDataPoints = React.useMemo(() => {
@@ -815,6 +874,8 @@ const ERTParser = ({
       setFileElectrodeCount(vtkData.electrodeCount);
       setFileProfileLength(vtkData.profileLength);
       setTopographyData(vtkData.topography);
+      setDirectVtkCellGrid(vtkData.cellGrid || null);
+      setDirectVtkMesh(vtkData.mesh || null);
       setDataPoints(vtkData.points);
       setSelectedIndices([...Array(vtkData.points.length).keys()]);
       setLoading(false);
@@ -822,6 +883,8 @@ const ERTParser = ({
     }
 
     const lines = text.split('\n');
+    setDirectVtkCellGrid(null);
+    setDirectVtkMesh(null);
     const parsed = [];
     const secondLineSpacing = Number(String(lines[1] || '').trim().split(/[,\t ]+/)[0]);
     const parsedSource = parseRes2dinvSource(text);
@@ -947,6 +1010,38 @@ const ERTParser = ({
       reader.readAsText(file);
     });
 
+    const parseNpzFileViaBackend = async (file) => {
+      try {
+        const formData = new FormData();
+        formData.append('data_file', file);
+        const res = await requestAdminApi('/ert/parse-data-file', null, {
+          method: 'POST',
+          body: formData,
+        });
+        if (cancelled) return;
+        if (res?.points?.length) {
+          dataPointsRef.current = res.points;
+          setFileSpacing(res.spacing);
+          setFileElectrodeCount(res.electrode_count);
+          setFileProfileLength(res.profile_length);
+          setTopographyData(res.topography || null);
+          setDirectVtkCellGrid(null);
+          setDirectVtkMesh(null);
+          setDataPoints(res.points);
+          setSelectedIndices([...Array(res.points.length).keys()]);
+          setLoading(false);
+        } else {
+          setErrorMsg('后端解析 .npz 返回的数据为空。');
+          setLoading(false);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setErrorMsg(err.message || '后端解析 .npz 数据失败。');
+          setLoading(false);
+        }
+      }
+    };
+
     const processData = async () => {
       setInversionRuns([]);
       setSelectedInversionRunId(null);
@@ -955,6 +1050,10 @@ const ERTParser = ({
 
       // 1) 直接传进来就是浏览器 File，最简单的路径
       if (fileObj instanceof File) {
+        if (fileObj.name && fileObj.name.toLowerCase().endsWith('.npz')) {
+          await parseNpzFileViaBackend(fileObj);
+          return;
+        }
         try {
           const text = await readFile(fileObj);
           handleText(text);
@@ -970,20 +1069,33 @@ const ERTParser = ({
       // 2) 传进来是云盘元数据对象（非 rawFile）：从 IndexedDB / OSS / 内联文本里取真实内容
       if (fileObj && typeof fileObj === 'object') {
         try {
-          if (typeof fileObj.content === 'string' && fileObj.content.length > 0) {
-            handleText(fileObj.content);
-            return;
-          }
-          if (typeof fileObj.inlineTextContent === 'string' && fileObj.inlineTextContent.length > 0) {
-            handleText(fileObj.inlineTextContent);
-            return;
-          }
-          const resolved = await resolveDriveFileContent(fileObj, fileObj?.name || 'data.dat');
-          if (cancelled) return;
-          if (resolved instanceof File) {
-            const text = await readFile(resolved);
-            handleText(text);
-            return;
+          if (fileObj.name && fileObj.name.toLowerCase().endsWith('.npz')) {
+            const resolved = await resolveDriveFileContent(fileObj, fileObj?.name || 'data.npz');
+            if (cancelled) return;
+            if (resolved instanceof File) {
+              await parseNpzFileViaBackend(resolved);
+              return;
+            }
+          } else {
+            if (typeof fileObj.content === 'string' && fileObj.content.length > 0) {
+              handleText(fileObj.content);
+              return;
+            }
+            if (typeof fileObj.inlineTextContent === 'string' && fileObj.inlineTextContent.length > 0) {
+              handleText(fileObj.inlineTextContent);
+              return;
+            }
+            const resolved = await resolveDriveFileContent(fileObj, fileObj?.name || 'data.dat');
+            if (cancelled) return;
+            if (resolved instanceof File) {
+              if (resolved.name && resolved.name.toLowerCase().endsWith('.npz')) {
+                await parseNpzFileViaBackend(resolved);
+              } else {
+                const text = await readFile(resolved);
+                handleText(text);
+              }
+              return;
+            }
           }
           // 没拿到任何真实内容才允许退到模拟数据，避免悄悄展示 mock 让人误判
           if (!cancelled) {
@@ -1111,11 +1223,24 @@ const ERTParser = ({
 
   const formatInversionRunLabel = (run, index) => {
     const params = run?.result?.params || {};
+    const backendValue = String(
+      run?.result?.backend
+      || params.inversionBackend
+      || params.inversion_backend
+      || run?.backend
+      || ''
+    ).toLowerCase();
+    const backendLabel = backendValue.includes('simpeg')
+      ? 'SimPEG'
+      : backendValue.includes('pygimli')
+        ? 'pyGIMLi'
+        : '';
     const zWeight = Number(params.zWeight ?? params.z_weight);
     const lambdaParam = Number(params.lambdaParam ?? params.lambda_param);
     const maxIter = Number(params.maxIter ?? params.max_iter);
     const rrms = Number(run?.result?.rrms);
     const pieces = [`第 ${index + 1} 次`];
+    if (backendLabel) pieces.unshift(backendLabel);
     if (Number.isFinite(zWeight)) pieces.push(`zW ${zWeight}`);
     if (Number.isFinite(lambdaParam)) pieces.push(`λ ${lambdaParam}`);
     if (Number.isFinite(maxIter)) pieces.push(`${maxIter}迭代`);
@@ -1238,6 +1363,43 @@ const ERTParser = ({
       return selectedInversionRun.result || null;
     }
     return null;
+  };
+
+  const makeRunFromInversionResult = (result, sequence, runName = null) => {
+    const currentData = dataPoints.map(p => {
+      const [x, z, rho] = p;
+      return [x, z, editedRho[`${x},${z}`] ?? rho];
+    });
+    const backendFinalData = normalizePreviewPoints(getPreferredInversionPreviewPoints(result));
+    const inverted = backendFinalData.length ? backendFinalData : createInversionPreviewData(currentData, result);
+    const iterations = (Array.isArray(result?.iteration_results) ? result.iteration_results : [])
+      .map((item) => {
+        const data = normalizePreviewPoints(getPreferredInversionPreviewPoints(item));
+        if (!data.length) return null;
+        const iteration = Number(item?.iteration);
+        const key = Number.isFinite(iteration) ? `iter_${iteration}` : `iter_${item?.vtk || item?.vector || Math.random()}`;
+        return {
+          key,
+          iteration,
+          label: formatIterationLabel(item),
+          data,
+          cellGrid: item?.simpeg_cell_grid || null,
+          boundaryPoints: normalizeBoundaryPoints(getPreferredInversionBoundaryPoints(item)),
+          files: item
+        };
+      })
+      .filter(Boolean);
+
+    return {
+      id: result?.task_id || `inversion_${sequence}`,
+      name: runName || `${getSourceStem(fileObj?.name)}_${buildInversionRunName(result, sequence)}`,
+      data: inverted,
+      cellGrid: result?.simpeg_cell_grid || null,
+      boundaryPoints: normalizeBoundaryPoints(getPreferredInversionBoundaryPoints(result)),
+      iterations,
+      result,
+      createdAt: result?.completed_at || ''
+    };
   };
 
   const normalizeSimpegCellGrid = (gridLike = null) => {
@@ -1466,48 +1628,22 @@ const ERTParser = ({
     if (result?.task_id) {
       handledInversionTaskIdsRef.current.add(result.task_id);
     }
-    const currentData = dataPoints.map(p => {
-      const [x, z, rho] = p;
-      return [x, z, editedRho[`${x},${z}`] ?? rho];
-    });
     const sequence = inversionRuns.length + 1;
     const runName = `${getSourceStem(fileObj?.name)}_${buildInversionRunName(result, sequence)}`;
-    const backendFinalData = normalizePreviewPoints(getPreferredInversionPreviewPoints(result));
-    const inverted = backendFinalData.length ? backendFinalData : createInversionPreviewData(currentData, result);
-    const iterations = (Array.isArray(result?.iteration_results) ? result.iteration_results : [])
-      .map((item) => {
-        const data = normalizePreviewPoints(getPreferredInversionPreviewPoints(item));
-        if (!data.length) return null;
-        const iteration = Number(item?.iteration);
-        const key = Number.isFinite(iteration) ? `iter_${iteration}` : `iter_${item?.vtk || item?.vector || Math.random()}`;
-        return {
-          key,
-          iteration,
-          label: formatIterationLabel(item),
-          data,
-          cellGrid: item?.simpeg_cell_grid || null,
-          boundaryPoints: normalizeBoundaryPoints(getPreferredInversionBoundaryPoints(item)),
-          files: item
-        };
-      })
-      .filter(Boolean);
-    const run = {
-      id: result?.task_id || `inversion_${sequence}`,
-      name: runName,
-      data: inverted,
-      cellGrid: result?.simpeg_cell_grid || null,
-      boundaryPoints: normalizeBoundaryPoints(getPreferredInversionBoundaryPoints(result)),
-      iterations,
-      result,
-      createdAt: result?.completed_at || ''
-    };
+    const run = makeRunFromInversionResult(result, sequence, runName);
 
-    setInversionRuns((prev) => [...prev, run]);
+    setInversionRuns((prev) => {
+      const existingIndex = prev.findIndex((item) => item.id === run.id);
+      if (existingIndex < 0) return [...prev, run];
+      const next = [...prev];
+      next[existingIndex] = run;
+      return next;
+    });
     setSelectedInversionRunId(run.id);
     setSelectedInversionIterationKey('final');
     setDataType('inverted');
-    if (chartRef.current) refreshChartAfterReady(chartRef.current.getEchartsInstance(), inverted);
-    if (chartRef2.current) refreshChartAfterReady(chartRef2.current.getEchartsInstance(), inverted);
+    if (chartRef.current) refreshChartAfterReady(chartRef.current.getEchartsInstance(), run.data);
+    if (chartRef2.current) refreshChartAfterReady(chartRef2.current.getEchartsInstance(), run.data);
     persistActiveInversionTask({
       task_id: result?.task_id || run.id,
       status: 'success',
@@ -1523,6 +1659,44 @@ const ERTParser = ({
     void archiveInversionResult(result, runName);
   };
 
+  const handleLiveInversionProgress = (task, progress) => {
+    const iterationResults = Array.isArray(progress?.iteration_results) ? progress.iteration_results : [];
+    if (!iterationResults.length) return;
+    const latest = progress?.latest_iteration_result || iterationResults[iterationResults.length - 1];
+    if (!latest) return;
+
+    const liveResult = {
+      ...latest,
+      task_id: task.task_id,
+      status: task.status || 'running',
+      backend: task.params?.backend || task.params?.inversion_backend || 'simpeg',
+      params: task.params || {},
+      created_at: task.created_at,
+      started_at: task.started_at,
+      completed_at: task.finished_at || new Date().toISOString(),
+      iteration_results: iterationResults,
+    };
+    const sequence = Math.max(1, inversionRuns.findIndex((run) => run.id === task.task_id) + 1 || inversionRuns.length + 1);
+    const run = makeRunFromInversionResult(
+      liveResult,
+      sequence,
+      `${getSourceStem(fileObj?.name)}_${buildInversionRunName(liveResult, sequence)}`
+    );
+    setInversionRuns((prev) => {
+      const existingIndex = prev.findIndex((item) => item.id === run.id);
+      if (existingIndex < 0) return [...prev, run];
+      const next = [...prev];
+      next[existingIndex] = run;
+      return next;
+    });
+
+    const latestIteration = Number(latest?.iteration);
+    setSelectedInversionRunId(run.id);
+    setSelectedInversionIterationKey(Number.isFinite(latestIteration) ? `iter_${latestIteration}` : 'final');
+    setDataType('inverted');
+    setCompareMode(true);
+  };
+
   useEffect(() => {
     try {
       const raw = window.localStorage.getItem(taskStorageKey);
@@ -1535,6 +1709,150 @@ const ERTParser = ({
       console.warn('Failed to restore ERT inversion task state', error);
     }
   }, [taskStorageKey]);
+
+  useEffect(() => {
+    if (!fileObj?.name || !selectedProject?.id || !Array.isArray(fileSystem) || !dataPoints.length) return undefined;
+    if (inversionRuns.length > 0) return undefined;
+
+    const sourceName = String(fileObj.name || '').trim();
+    const sourceStem = getSourceStem(sourceName);
+    const restoreKey = `${selectedProject.id}:${fileObj?.id || fileObj?.path || sourceName}:${fileSystem.length}`;
+    if (restoredArchiveKeyRef.current === restoreKey) return undefined;
+    restoredArchiveKeyRef.current = restoreKey;
+
+    let cancelled = false;
+    const foldersById = new Map(
+      fileSystem
+        .filter((item) => item?.type === 'folder')
+        .map((item) => [item.id, item])
+    );
+    const rootFolderFor = (item) => {
+      const parent = foldersById.get(item?.parentId);
+      if (parent?.iterationIndex !== undefined || /^第\s*\d+\s*次迭代$/.test(String(parent?.name || ''))) {
+        return foldersById.get(parent.parentId) || parent;
+      }
+      return parent || null;
+    };
+    const isSameSource = (item) => (
+      String(item?.sourceFileName || '').trim() === sourceName
+      || String(item?.source_file_name || '').trim() === sourceName
+    );
+    const isLikelySourceFolder = (folder) => {
+      const name = String(folder?.name || '');
+      return isSameSource(folder) || (
+        sourceStem
+        && name.startsWith(`${sourceStem}_`)
+        && /反演|inversion/i.test(name)
+      );
+    };
+
+    const groups = new Map();
+    (fileSystem || []).forEach((item) => {
+      if (item?.type !== 'file' || item?.category !== 'results') return;
+      const rootFolder = rootFolderFor(item);
+      if (!rootFolder || (!isSameSource(item) && !isLikelySourceFolder(rootFolder))) return;
+      const group = groups.get(rootFolder.id) || { folder: rootFolder, files: [] };
+      group.files.push(item);
+      groups.set(rootFolder.id, group);
+    });
+
+    const readArchivedVtk = async (fileItem) => {
+      const resolved = await resolveDriveFileContent(fileItem, fileItem?.name || 'resistivity.vtk');
+      const text = await readBrowserFileText(resolved);
+      const vtkData = parseAsciiVtkResistivity(text);
+      if (!vtkData?.points?.length) return null;
+      return {
+        preview_points: vtkData.points,
+        vtk_mesh: vtkData.mesh || null,
+        simpeg_cell_grid: vtkData.cellGrid || null,
+        vtk: fileItem?.fileUrl || fileItem?.localPath || fileItem?.name || null,
+      };
+    };
+
+    const readArchivedSimpegNpz = async (fileItem) => {
+      const fileUrl = String(fileItem?.fileUrl || '');
+      if (!fileUrl) return null;
+      const apiPath = `${fileUrl.replace(/^\/admin\b/, '')}/preview`;
+      const preview = await requestAdminApi(apiPath, null, { method: 'GET' });
+      if (!preview?.simpeg_cell_grid && !Array.isArray(preview?.preview_points)) return null;
+      return {
+        ...preview,
+        npz: fileItem?.fileUrl || fileItem?.localPath || fileItem?.name || null,
+      };
+    };
+
+    const restore = async () => {
+      const restoredRuns = [];
+      const sortedGroups = Array.from(groups.values())
+        .sort((left, right) => String(left.folder?.date || '').localeCompare(String(right.folder?.date || '')));
+
+      for (const group of sortedGroups) {
+        const finalNpz = group.files.find((item) => /^simpeg_ert_inversion\.npz$/i.test(String(item?.name || '')));
+        const finalVtk = group.files.find((item) => /^resistivity\.vtk$/i.test(String(item?.name || '')));
+        const finalFile = finalNpz || finalVtk;
+        if (!finalFile) continue;
+        const finalData = await (finalNpz ? readArchivedSimpegNpz(finalNpz) : readArchivedVtk(finalVtk)).catch((error) => {
+          console.warn('Failed to restore archived ERT final result', error);
+          return null;
+        });
+        if (cancelled) return;
+        if (!finalData) continue;
+
+        const iterationFiles = group.files
+          .map((item) => ({ item, match: String(item?.name || '').match(/^iteration_(\d+)\.(vtk|npz)$/i) }))
+          .filter(({ match }) => match)
+          .filter(({ match }) => (finalNpz ? String(match[2] || '').toLowerCase() === 'npz' : String(match[2] || '').toLowerCase() === 'vtk'))
+          .sort((left, right) => Number(left.match[1]) - Number(right.match[1]));
+        const iterationResults = [];
+        for (const { item, match } of iterationFiles) {
+          const isSimpegNpz = String(match[2] || '').toLowerCase() === 'npz';
+          const iterationData = await (isSimpegNpz ? readArchivedSimpegNpz(item) : readArchivedVtk(item)).catch((error) => {
+            console.warn('Failed to restore archived ERT iteration result', error);
+            return null;
+          });
+          if (cancelled) return;
+          if (!iterationData) continue;
+          iterationResults.push({
+            ...iterationData,
+            iteration: Number(match[1]),
+          });
+        }
+
+        const archivedBackend = group.files.some((item) => /^simpeg_|simpeg_ert_inversion\.npz$/i.test(String(item?.name || '')))
+          ? 'simpeg'
+          : group.files.some((item) => /^(mesh|resistivity-mesh)\.bms$|^response\.vector$/i.test(String(item?.name || '')))
+            ? 'pygimli'
+            : '';
+        const result = {
+          ...finalData,
+          task_id: group.folder?.id || `archived_${group.folder?.name || restoredRuns.length + 1}`,
+          status: 'success',
+          backend: archivedBackend,
+          source: 'archive',
+          completed_at: group.folder?.date || finalFile?.date || '',
+          output_dir: group.folder?.archiveDir || null,
+          iteration_results: iterationResults,
+        };
+        restoredRuns.push(makeRunFromInversionResult(
+          result,
+          restoredRuns.length + 1,
+          group.folder?.name || `${sourceStem}_历史反演${restoredRuns.length + 1}`
+        ));
+      }
+
+      if (cancelled || !restoredRuns.length) return;
+      setInversionRuns(restoredRuns);
+      setSelectedInversionRunId(restoredRuns[restoredRuns.length - 1].id);
+      setSelectedInversionIterationKey('final');
+      setDataType('inverted');
+    };
+
+    void restore();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fileObj?.id, fileObj?.path, fileObj?.name, selectedProject?.id, fileSystem, dataPoints.length, inversionRuns.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!activeInversionTask?.task_id || !isActiveTaskStatus(activeInversionTask.status)) return undefined;
@@ -1556,6 +1874,7 @@ const ERTParser = ({
           finished_at: statusRes.finished_at || activeInversionTask.finished_at,
         };
         persistActiveInversionTask(nextTask);
+        handleLiveInversionProgress(nextTask, statusRes.progress);
 
         if (statusRes.status === 'success') {
           const finalRes = await requestAdminApi(`/ert/tasks/${encodeURIComponent(taskId)}/result`, null, { method: 'GET' });
@@ -1804,6 +2123,156 @@ const ERTParser = ({
     };
   };
 
+  const normalizeVtkPolygonMesh = (meshLike = null) => {
+    if (!meshLike || !Array.isArray(meshLike.cells) || !meshLike.cells.length) return null;
+    const cells = meshLike.cells
+      .map((cell) => ({
+        rho: Number(cell?.rho),
+        points: (Array.isArray(cell?.points) ? cell.points : [])
+          .map((point) => [Number(point?.[0]), Number(point?.[1])])
+          .filter(([x, y]) => Number.isFinite(x) && Number.isFinite(y))
+      }))
+      .filter((cell) => Number.isFinite(cell.rho) && cell.points.length >= 3);
+    if (!cells.length) return null;
+    const xValues = cells.flatMap((cell) => cell.points.map((point) => point[0]));
+    const yValues = cells.flatMap((cell) => cell.points.map((point) => point[1]));
+    return {
+      cells,
+      bounds: {
+        xMin: Math.min(...xValues),
+        xMax: Math.max(...xValues),
+        yMin: Math.min(...yValues),
+        yMax: Math.max(...yValues),
+      }
+    };
+  };
+
+  const buildVtkPolygonMeshOption = ({
+    mesh,
+    colors,
+    minVal,
+    maxVal,
+    isMaximized = false,
+    containerPx = null,
+  }) => {
+    const { cells, bounds } = mesh;
+    const L = 60, R = 76, T = 68, B = 50;
+    const chartH = containerPx ? containerPx.h : (isMaximized ? window.innerHeight - 60 : window.innerHeight * 0.82);
+    const xSpan = Math.max(bounds.xMax - bounds.xMin, 1);
+    const ySpan = Math.max(bounds.yMax - bounds.yMin, 1);
+    const padX = Math.max(xSpan * 0.02, 0.5);
+    const padY = Math.max(ySpan * 0.04, 0.5);
+    const maxVertexCount = Math.max(...cells.map((cell) => cell.points.length));
+    const data = cells.map((cell, index) => {
+      const coords = [];
+      for (let pointIndex = 0; pointIndex < maxVertexCount; pointIndex += 1) {
+        const point = cell.points[pointIndex] || cell.points[cell.points.length - 1];
+        coords.push(point[0], point[1]);
+      }
+      return {
+        value: [cell.rho, cell.points.length, index, ...coords],
+        rawPoints: cell.points,
+      };
+    });
+
+    return {
+      animation: false,
+      tooltip: {
+        trigger: 'item',
+        formatter: (params) => {
+          const rho = Number(params.value?.[0]);
+          const rawPoints = params.data?.rawPoints || [];
+          const cx = rawPoints.reduce((sum, point) => sum + point[0], 0) / Math.max(rawPoints.length, 1);
+          const cy = rawPoints.reduce((sum, point) => sum + point[1], 0) / Math.max(rawPoints.length, 1);
+          return `X: ${cx.toFixed(2)} m<br/>高程: ${cy.toFixed(2)} m<br/><b style="color:#3b82f6">视电阻率: ${rho.toFixed(1)} Ω·m</b>`;
+        },
+      },
+      grid: { left: L, right: R, top: T, bottom: B, containLabel: false },
+      dataZoom: [
+        {
+          id: 'heatmap-x-zoom',
+          type: 'inside',
+          xAxisIndex: 0,
+          zoomOnMouseWheel: true,
+          moveOnMouseWheel: false,
+          throttle: 40,
+          filterMode: 'none',
+        },
+        {
+          id: 'heatmap-y-zoom',
+          type: 'inside',
+          yAxisIndex: 0,
+          zoomOnMouseWheel: false,
+          moveOnMouseWheel: false,
+          throttle: 40,
+          filterMode: 'none',
+        },
+      ],
+      xAxis: {
+        type: 'value',
+        min: bounds.xMin - padX,
+        max: bounds.xMax + padX,
+        name: '测量距离 X (m)',
+        nameLocation: 'middle',
+        nameGap: 30,
+        splitLine: { lineStyle: { color: '#dbeafe', type: 'dashed' } },
+        axisLabel: { color: '#475569' },
+        scale: false,
+      },
+      yAxis: {
+        type: 'value',
+        min: bounds.yMin - padY,
+        max: bounds.yMax + padY,
+        name: '高程 (m)',
+        nameLocation: 'middle',
+        nameGap: 42,
+        inverse: false,
+        splitLine: { lineStyle: { color: '#e2e8f0', type: 'dashed' } },
+        axisLabel: { color: '#475569' },
+        scale: false,
+      },
+      visualMap: {
+        min: minVal,
+        max: maxVal,
+        dimension: 0,
+        seriesIndex: 0,
+        orient: 'vertical',
+        right: 10,
+        top: 'middle',
+        itemHeight: Math.min(220, Math.max(120, chartH - T - B - 20)),
+        text: ['高阻体', '低阻区'],
+        calculable: true,
+        inRange: { color: colors },
+      },
+      series: [
+        {
+          name: 'VTK Triangle Mesh',
+          type: 'custom',
+          renderItem: function (_params, api) {
+            const vertexCount = Number(api.value(1));
+            const points = [];
+            for (let pointIndex = 0; pointIndex < vertexCount; pointIndex += 1) {
+              const x = Number(api.value(3 + pointIndex * 2));
+              const y = Number(api.value(4 + pointIndex * 2));
+              points.push(api.coord([x, y]));
+            }
+            return {
+              type: 'polygon',
+              shape: { points },
+              style: api.style({
+                stroke: 'rgba(255,255,255,0.18)',
+                lineWidth: 0.35,
+              }),
+            };
+          },
+          encode: { tooltip: [0] },
+          data,
+          z: 3,
+        },
+      ],
+    };
+  };
+
   function getOption(isMaximized = false, activeSchemeId = 'rainbow', custColors = DEFAULT_CUSTOM, containerPx = null, isEditMode = false, overrideData = null) {
     const dataToUse = overrideData || activeDataPoints;
     const isInvertedSource = overrideData === inversionResult || (dataType === 'inverted' && !overrideData);
@@ -1816,19 +2285,59 @@ const ERTParser = ({
       ? (custColors.length >= 2 ? custColors : DEFAULT_CUSTOM)
       : (COLOR_SCHEMES.find(s => s.id === activeSchemeId)?.colors || COLOR_SCHEMES[0].colors);
 
-    const directSimpegGrid = isInvertedSource
-      ? normalizeSimpegCellGrid(getActiveInversionPayload(overrideData)?.simpeg_cell_grid)
+    const directVtkMeshOption = (!isInvertedSource || (isDirectVtkFile && !overrideData))
+      ? normalizeVtkPolygonMesh(directVtkMesh)
       : null;
+    if (directVtkMeshOption) {
+      const meshValues = directVtkMeshOption.cells.map((cell) => cell.rho).filter(Number.isFinite);
+      const meshMin = Math.min(...meshValues);
+      const meshMax = Math.max(...meshValues);
+      const meshOption = buildVtkPolygonMeshOption({
+        mesh: directVtkMeshOption,
+        colors,
+        minVal: meshMin,
+        maxVal: meshMax > meshMin ? meshMax : meshMin + 1,
+        isMaximized,
+        containerPx,
+      });
+      if (meshOption) return meshOption;
+    }
+
+    const inversionPayload = getActiveInversionPayload(overrideData);
+    const archivedVtkMeshOption = isInvertedSource
+      ? normalizeVtkPolygonMesh(inversionPayload?.vtk_mesh)
+      : null;
+    if (archivedVtkMeshOption) {
+      const meshValues = archivedVtkMeshOption.cells.map((cell) => cell.rho).filter(Number.isFinite);
+      const meshMin = Math.min(...meshValues);
+      const meshMax = Math.max(...meshValues);
+      const meshOption = buildVtkPolygonMeshOption({
+        mesh: archivedVtkMeshOption,
+        colors,
+        minVal: meshMin,
+        maxVal: meshMax > meshMin ? meshMax : meshMin + 1,
+        isMaximized,
+        containerPx,
+      });
+      if (meshOption) return meshOption;
+    }
+
+    const directVtkGrid = !isInvertedSource ? normalizeSimpegCellGrid(directVtkCellGrid) : null;
+    const directSimpegGrid = isInvertedSource
+      ? normalizeSimpegCellGrid(inversionPayload?.simpeg_cell_grid)
+      : directVtkGrid;
     if (directSimpegGrid) {
       const cellValues = directSimpegGrid.cells.map((cell) => cell[4]).filter(Number.isFinite);
       const sortedCellValues = [...cellValues].sort((a, b) => a - b);
       const cellMin = Math.min(...cellValues);
       const cellMax95 = sortedCellValues[Math.floor(sortedCellValues.length * 0.95)] ?? Math.max(...cellValues);
+      const cellMax = Math.max(...cellValues);
+      const colorMax = directVtkGrid ? cellMax : cellMax95;
       const directOption = buildSimpegCellGridOption({
         grid: directSimpegGrid,
         colors,
         minVal: cellMin,
-        maxVal: cellMax95 > cellMin ? cellMax95 : cellMin + 1,
+        maxVal: colorMax > cellMin ? colorMax : cellMin + 1,
         isMaximized,
         containerPx,
       });
@@ -2427,6 +2936,87 @@ const ERTParser = ({
     };
   }
 
+  function getFitComparisonOption(fitComparison = null) {
+    const obs = Array.isArray(fitComparison?.obs) ? fitComparison.obs.map(Number) : [];
+    const pred = Array.isArray(fitComparison?.pred) ? fitComparison.pred.map(Number) : [];
+    const misfitPct = Array.isArray(fitComparison?.misfit_pct) ? fitComparison.misfit_pct.map(Number) : [];
+    const count = Math.min(obs.length, pred.length);
+    if (!count) return {};
+    const indices = Array.from({ length: count }, (_, index) => index + 1);
+    const rrms = Number(fitComparison?.rms_pct);
+    const weighted = Number(fitComparison?.weighted_rms);
+    const titleParts = [];
+    if (Number.isFinite(rrms)) titleParts.push(`rRMS ${rrms.toFixed(2)}%`);
+    if (Number.isFinite(weighted)) titleParts.push(`W-RMS ${weighted.toFixed(2)}`);
+
+    return {
+      animation: false,
+      tooltip: {
+        trigger: 'axis',
+        formatter: (items = []) => {
+          const index = Number(items?.[0]?.axisValue || 0) - 1;
+          const lines = [`测点: ${index + 1}`];
+          lines.push(`观测: ${Number(obs[index]).toFixed(3)} Ω·m`);
+          lines.push(`预测: ${Number(pred[index]).toFixed(3)} Ω·m`);
+          if (Number.isFinite(misfitPct[index])) lines.push(`误差: ${Number(misfitPct[index]).toFixed(2)}%`);
+          return lines.join('<br/>');
+        },
+      },
+      legend: { top: 2, left: 10, itemWidth: 12, itemHeight: 8, textStyle: { fontSize: 11 } },
+      title: {
+        text: titleParts.join(' · '),
+        right: 12,
+        top: 4,
+        textStyle: { fontSize: 11, color: '#475569', fontWeight: 500 },
+      },
+      grid: { left: 48, right: 52, top: 30, bottom: 28 },
+      xAxis: {
+        type: 'category',
+        data: indices,
+        name: '测点',
+        nameGap: 18,
+        axisLabel: { color: '#64748b', fontSize: 10 },
+      },
+      yAxis: [
+        {
+          type: 'value',
+          name: 'ρa (Ω·m)',
+          axisLabel: { color: '#64748b', fontSize: 10 },
+          splitLine: { lineStyle: { color: '#e2e8f0', type: 'dashed' } },
+        },
+        {
+          type: 'value',
+          name: '误差 %',
+          axisLabel: { color: '#64748b', fontSize: 10 },
+          splitLine: { show: false },
+        },
+      ],
+      series: [
+        {
+          name: '观测',
+          type: 'line',
+          data: obs.slice(0, count),
+          showSymbol: false,
+          lineStyle: { color: '#2563eb', width: 1.5 },
+        },
+        {
+          name: '预测',
+          type: 'line',
+          data: pred.slice(0, count),
+          showSymbol: false,
+          lineStyle: { color: '#dc2626', width: 1.5 },
+        },
+        {
+          name: '误差',
+          type: 'bar',
+          yAxisIndex: 1,
+          data: misfitPct.slice(0, count),
+          itemStyle: { color: 'rgba(15, 118, 110, 0.35)' },
+        },
+      ],
+    };
+  }
+
   useEffect(() => {
     if (loading || errorMsg) return;
 
@@ -2457,7 +3047,13 @@ const ERTParser = ({
       }
       instance2.setOption(opt2, { notMerge: true });
     }
-  }, [displayMode, maximized, showTable, loading, errorMsg, editMode, compareMode, dataType, inversionResult, activeDataPoints.length, selectedIndices.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    if (compareMode && fitChartRef.current && currentFitComparison) {
+      const fitInstance = fitChartRef.current.getEchartsInstance();
+      fitInstance.resize();
+      fitInstance.setOption(getFitComparisonOption(currentFitComparison), { notMerge: true });
+    }
+  }, [displayMode, maximized, showTable, loading, errorMsg, editMode, compareMode, dataType, inversionResult, currentFitComparison, activeDataPoints.length, selectedIndices.length, directVtkMesh, directVtkCellGrid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (loading || errorMsg || displayMode !== 'heatmap' || !chartRef.current || selectedIndices.length === 0) return undefined;
@@ -2480,7 +3076,7 @@ const ERTParser = ({
       window.cancelAnimationFrame(rafId);
       window.clearTimeout(timeoutId);
     };
-  }, [loading, errorMsg, displayMode, maximized, showTable, dataType, selectedIndices.length, activeDataPoints.length]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [loading, errorMsg, displayMode, maximized, showTable, dataType, selectedIndices.length, activeDataPoints.length, directVtkMesh, directVtkCellGrid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (loading || errorMsg || isDragging) return;
@@ -2502,7 +3098,11 @@ const ERTParser = ({
         : getOption(maximized, schemeId, customColors, containerPx2, editMode, inversionResult);
       instance2.setOption(opt2, { notMerge: false, lazyUpdate: true });
     }
-  }, [schemeId, customColors, editedRho, selectedPt, isDragging, editMode, compareMode, dataType, inversionResult]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    if (compareMode && fitChartRef.current && currentFitComparison) {
+      fitChartRef.current.getEchartsInstance().setOption(getFitComparisonOption(currentFitComparison), { notMerge: false, lazyUpdate: true });
+    }
+  }, [schemeId, customColors, editedRho, selectedPt, isDragging, editMode, compareMode, dataType, inversionResult, currentFitComparison, directVtkMesh, directVtkCellGrid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const refreshChartAfterReady = (inst, overrideData = null) => {
     const apply = () => {
@@ -2586,16 +3186,18 @@ const ERTParser = ({
             {displayMode === 'heatmap' && (
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                 <Palette size={16} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
-                <select
+                <div style={{ position: 'relative', width: '178px', flexShrink: 0 }}>
+                  <select
                   value={schemeId}
                   onChange={e => setSchemeId(e.target.value)}
                   style={{
+                    width: '100%',
                     background: 'var(--surface-hover)',
                     border: '1px solid var(--border-color)',
                     borderRadius: '6px',
                     color: 'var(--text-primary)',
                     fontSize: '13px',
-                    padding: '4px 8px',
+                    padding: '4px 72px 4px 8px',
                     cursor: 'pointer',
                     outline: 'none',
                   }}
@@ -2603,12 +3205,29 @@ const ERTParser = ({
                   {COLOR_SCHEMES.map(s => (
                     <option key={s.id} value={s.id}>{s.name}</option>
                   ))}
-                </select>
+                  </select>
                 {/* 当前色谱预览 */}
-                <div style={{ display: 'flex', height: '20px', width: '80px', borderRadius: '4px', overflow: 'hidden', border: '1px solid var(--border-color)', flexShrink: 0 }}>
+                  <div
+                  aria-hidden="true"
+                  style={{
+                    position: 'absolute',
+                    top: '50%',
+                    right: '24px',
+                    transform: 'translateY(-50%)',
+                    display: 'flex',
+                    height: '16px',
+                    width: '54px',
+                    borderRadius: '3px',
+                    overflow: 'hidden',
+                    border: '1px solid var(--border-color)',
+                    pointerEvents: 'none',
+                    background: 'var(--surface-card)',
+                  }}
+                  >
                   {activeColors.map((c, i) => (
                     <div key={i} style={{ flex: 1, background: c }} />
                   ))}
+                  </div>
                 </div>
               </div>
             )}

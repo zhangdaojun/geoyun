@@ -496,7 +496,7 @@ const CloudCompute = ({ currentUser }) => {
         setProgress({
           current: items.length,
           total: items.length,
-          status: '澶勭悊瀹屾垚',
+          status: '处理完成',
         });
       } catch (error) {
         setErrorMsg(error?.message || '处理失败');

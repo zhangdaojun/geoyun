@@ -1,8 +1,7 @@
 import { defaultCurrentUser, defaultUsers, ensureCurrentUser, ensureUserList } from '../utils/accessControl';
 import { ensureAppSettings } from '../utils/appSettings';
-import { ensureProjectShape } from '../utils/projectModel';
 
-export const GEOYUN_APP_STORAGE_KEY = 'geoyun_app_state_v1';
+export const GEOYUN_APP_STORAGE_KEY = 'geoyun_app_state_v2';
 
 export const normalizeView = (view) => (
   ['dashboard', 'map', 'projects', 'data', 'cloud', 'settings', 'admin-users'].includes(view)
@@ -10,18 +9,7 @@ export const normalizeView = (view) => (
     : 'dashboard'
 );
 
-export const serializeProjectsForStorage = (projects) => {
-  return (projects || []).map(project => ({
-    ...project,
-    cloudData: {
-      ...(project.cloudData || {}),
-      items: (project.cloudData?.items || []).map(item => {
-        const { rawFile: _rawFile, ...rest } = item;
-        return rest;
-      })
-    }
-  }));
-};
+export const serializeProjectsForStorage = () => null;
 
 export const loadPersistedAppState = () => {
   try {
@@ -29,7 +17,7 @@ export const loadPersistedAppState = () => {
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     return {
-      projectsList: Array.isArray(parsed.projectsList) ? parsed.projectsList.map(ensureProjectShape) : null,
+      projectsList: null,
       selectedProjectId: parsed.selectedProjectId || null,
       currentView: normalizeView(parsed.currentView),
       pendingDriveFolderId: parsed.pendingDriveFolderId || null,

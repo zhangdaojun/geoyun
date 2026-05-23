@@ -5,12 +5,8 @@ import mimetypes
 import os
 import re
 import shutil
-import subprocess
-import sys
 import tempfile
-import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
@@ -26,87 +22,11 @@ from ..deps import get_current_admin_user
 from ..models import User
 from ..schemas import EMAP1TaskCreateResponse, EMAP1TaskStatusResponse
 from ..services.pygimli_ert import _create_surfer_outputs_from_vtk, _write_surfer_srf_script
+from ..tasks.ert_tasks import run_ert_inversion_task
 from .admin_emap1 import _extract_meta, _normalize_status, _progress_from_meta
 
 router = APIRouter(prefix="/admin/ert", tags=["admin-ert"])
 
-_LOCAL_ERT_TASK_RESULTS: Dict[str, Dict[str, Any]] = {}
-_LOCAL_ERT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ert-local")
-_LOCAL_ERT_QUEUE_LOCK = threading.Lock()
-_LOCAL_ERT_QUEUE_ORDER: list[str] = []  # task ids waiting to start, FIFO
-_ERT_INVERSION_TIMEOUT_SECONDS = int(os.environ.get("ERT_INVERSION_TIMEOUT_SECONDS", 60 * 30))
-_ERT_TERMINATE_GRACE_SECONDS = 10
-_ERT_KILL_GRACE_SECONDS = 5
-
-
-def _terminate_subprocess_tree(process: subprocess.Popen) -> None:
-    """Kill the inversion subprocess (and any descendants) with escalation: SIGTERM → SIGKILL."""
-    if process.poll() is not None:
-        return
-
-    pid = process.pid
-    if os.name == "nt":
-        # taskkill /T walks the job tree on Windows; suppresses the noisy stderr.
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                check=False,
-                capture_output=True,
-                timeout=_ERT_KILL_GRACE_SECONDS,
-            )
-        except Exception:
-            pass
-        try:
-            process.terminate()
-        except Exception:
-            pass
-    else:
-        try:
-            process.terminate()
-        except Exception:
-            pass
-
-    try:
-        process.wait(timeout=_ERT_TERMINATE_GRACE_SECONDS)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-
-    try:
-        process.kill()
-    except Exception:
-        pass
-    try:
-        process.wait(timeout=_ERT_KILL_GRACE_SECONDS)
-    except Exception:
-        pass
-
-
-def _enqueue_task(task_id: str) -> tuple[int, int]:
-    with _LOCAL_ERT_QUEUE_LOCK:
-        _LOCAL_ERT_QUEUE_ORDER.append(task_id)
-        position = len(_LOCAL_ERT_QUEUE_ORDER)
-        return position, position
-
-
-def _dequeue_task(task_id: str) -> None:
-    with _LOCAL_ERT_QUEUE_LOCK:
-        try:
-            _LOCAL_ERT_QUEUE_ORDER.remove(task_id)
-        except ValueError:
-            pass
-
-
-def _queue_position_for(task_id: str) -> tuple[Optional[int], Optional[int]]:
-    with _LOCAL_ERT_QUEUE_LOCK:
-        total = len(_LOCAL_ERT_QUEUE_ORDER)
-        if total == 0:
-            return None, None
-        try:
-            index = _LOCAL_ERT_QUEUE_ORDER.index(task_id)
-        except ValueError:
-            return None, total
-        return index + 1, total
 _ERT_ARCHIVE_ROOT = Path(__file__).resolve().parents[2] / "data" / "ert_archives"
 _ERT_RESULT_SUFFIXES = {
     ".bln",
@@ -123,70 +43,11 @@ _ERT_RESULT_SUFFIXES = {
     ".vector",
     ".vtk",
     ".xyz",
+    ".npz",
 }
 
-
-def _summarize_ert_error(message: str) -> str:
-    text = str(message or "").strip()
-    if "There are data values equals 0.0" in text:
-        return "数据中存在 0 值测点，pyGIMLi 无法反演；请剔除视电阻率/电阻为 0 的数据后重试。"
-    if "rhoa" in text or "apparent resistivity" in text:
-        return "数据文件缺少有效的正值视电阻率 rhoa；请确认 DAT 为 RES2DINV 格式且视电阻率列不为 0。"
-    for line in reversed(text.splitlines()):
-        line = line.strip()
-        if line.startswith("RuntimeError:") or line.startswith("ValueError:"):
-            return line.split(":", 1)[1].strip() or line
-    return text[-1000:] or "二维反演失败"
-
-
-def _append_task_log(task_id: str, line: str) -> None:
-    cleaned = re.sub(r"\x1b\[[0-9;]*m", "", str(line or "")).strip()
-    if not cleaned:
-        return
-    task = _LOCAL_ERT_TASK_RESULTS.get(task_id)
-    if not task:
-        return
-    logs = task.setdefault("logs", [])
-    logs.append(cleaned)
-    del logs[:-80]
-
-    max_iter = max(int(task.get("max_iter") or 1), 1)
-    iteration_match = re.search(r"(?:iter(?:ation)?|Iteration)\D*(\d+)", cleaned)
-    if not iteration_match:
-        iteration_match = re.match(r"\s*(\d+)\s*:", cleaned)
-    if not iteration_match:
-        iteration_match = re.match(r"\s*(\d+)\s+[-+0-9.eE]+", cleaned)
-    if iteration_match:
-        current = min(max(int(iteration_match.group(1)), 1), max_iter)
-        percent = min(95, max(30, int(30 + (current / max_iter) * 65)))
-        task["progress"] = {
-            "current": current,
-            "total": max_iter,
-            "percent": percent,
-            "message": f"正在进行第 {current}/{max_iter} 次迭代",
-            "logs": list(logs),
-        }
-    else:
-        count_match = re.match(r"\s*(\d+)\s*/\s*(\d+)\s*$", cleaned)
-        if count_match:
-            current = int(count_match.group(1))
-            total = max(int(count_match.group(2)), 1)
-            percent = min(60, max(15, int(15 + (current / total) * 40)))
-            task["progress"] = {
-                "current": current,
-                "total": total,
-                "percent": percent,
-                "message": f"正在计算 Jacobian {current}/{total}",
-                "logs": list(logs),
-            }
-            return
-        progress = dict(task.get("progress") or {})
-        progress.update({"logs": list(logs), "message": cleaned[-120:]})
-        task["progress"] = progress
-
-
 _ERT_MAX_UPLOAD_BYTES = 256 * 1024 * 1024  # 256 MB hard cap to avoid memory blow-ups
-_ERT_LOCAL_INPUT_SUFFIXES = {".dat", ".shm", ".txt", ".csv", ".xyz"}
+_ERT_LOCAL_INPUT_SUFFIXES = {".dat", ".shm", ".txt", ".csv", ".xyz", ".npz"}
 
 
 class ERTArchiveRequest(BaseModel):
@@ -279,206 +140,270 @@ def _rewrite_archived_surfer_script(script_path: Path) -> None:
     )
 
 
+def _load_live_simpeg_iteration_results(task: Dict[str, Any]) -> list[dict[str, Any]]:
+    output_dir = task.get("output_dir")
+    if not output_dir:
+        return []
+    output_path = Path(str(output_dir))
+    if not output_path.is_dir():
+        return []
+
+    cached = task.setdefault("iteration_preview_cache", {})
+    results: list[dict[str, Any]] = []
+    try:
+        from ..services.simpeg_ert import build_simpeg_preview_from_npz
+
+        for npz_path in sorted(output_path.glob("iteration_*.npz")):
+            cache_key = str(npz_path)
+            stat = npz_path.stat()
+            cached_item = cached.get(cache_key)
+            if (
+                isinstance(cached_item, dict)
+                and cached_item.get("mtime") == stat.st_mtime
+                and cached_item.get("size") == stat.st_size
+            ):
+                payload = cached_item.get("payload")
+            else:
+                payload = build_simpeg_preview_from_npz(npz_path)
+                vector_path = npz_path.with_suffix(".vector")
+                if vector_path.is_file():
+                    payload["vector"] = str(vector_path)
+                cached[cache_key] = {
+                    "mtime": stat.st_mtime,
+                    "size": stat.st_size,
+                    "payload": payload,
+                }
+            if isinstance(payload, dict):
+                results.append(payload)
+    except Exception:
+        return results
+    return results
+
+
+def _load_live_pygimli_iteration_results(task: Dict[str, Any]) -> list[dict[str, Any]]:
+    output_dir = task.get("output_dir")
+    if not output_dir:
+        return []
+    output_path = Path(str(output_dir))
+    iterations_dir = output_path / "ERTManager" / "iterations"
+    if not iterations_dir.is_dir():
+        return []
+
+    cached = task.setdefault("iteration_preview_cache", {})
+    results: list[dict[str, Any]] = []
+    try:
+        from ..services.pygimli_ert import (
+            _extract_vtk_polygon_mesh,
+            _extract_vtk_cell_resistivity_points,
+            _extract_vtk_node_resistivity_points,
+            _read_surfer_ascii_grid_points,
+            _read_surfer_boundary_bln,
+            _surfer_output_paths,
+        )
+
+        for vtk_path in sorted(iterations_dir.glob("iteration_*.vtk")):
+            cache_key = str(vtk_path)
+            stat = vtk_path.stat()
+            cached_item = cached.get(cache_key)
+            if (
+                isinstance(cached_item, dict)
+                and cached_item.get("mtime") == stat.st_mtime
+                and cached_item.get("size") == stat.st_size
+            ):
+                payload = cached_item.get("payload")
+            else:
+                stem = vtk_path.stem
+                match = re.search(r"iteration_(\d+)", stem)
+                iteration_index = int(match.group(1)) if match else 0
+
+                vector_path = vtk_path.with_suffix(".vector")
+                surfer_paths = _surfer_output_paths(vtk_path)
+
+                grid_path = surfer_paths.get("grid")
+                surfer_preview_points = []
+                if grid_path and grid_path.is_file():
+                    surfer_preview_points = _read_surfer_ascii_grid_points(grid_path)
+
+                boundary_path = surfer_paths.get("boundary")
+                surfer_boundary_points = []
+                if boundary_path and boundary_path.is_file():
+                    surfer_boundary_points = _read_surfer_boundary_bln(boundary_path)
+
+                payload = {
+                    "iteration": iteration_index,
+                    "vector": str(vector_path) if vector_path.is_file() else None,
+                    "vtk": str(vtk_path),
+                    "vtk_mesh": _extract_vtk_polygon_mesh(vtk_path),
+                    "preview_points": _extract_vtk_cell_resistivity_points(vtk_path),
+                    "mesh_node_points": _extract_vtk_node_resistivity_points(vtk_path),
+                    "surfer_preview_points": surfer_preview_points,
+                    "surfer_boundary_points": surfer_boundary_points,
+                    "surfer_grid": str(grid_path) if grid_path and grid_path.is_file() else None,
+                    "surfer_auxiliary_files": [
+                        str(p) for p in surfer_paths.values()
+                        if p.is_file() and p != vtk_path and p != grid_path
+                    ],
+                    "surfer_macro_script": str(surfer_paths.get("script")) if surfer_paths.get("script") and surfer_paths["script"].is_file() else None,
+                    "surfer_readme": str(surfer_paths.get("readme")) if surfer_paths.get("readme") and surfer_paths["readme"].is_file() else None,
+                }
+                cached[cache_key] = {
+                    "mtime": stat.st_mtime,
+                    "size": stat.st_size,
+                    "payload": payload,
+                }
+            if isinstance(payload, dict):
+                results.append(payload)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Error loading live pyGIMLi iteration results: %s", exc)
+        return results
+    return results
+
+
+
+def parse_npz_to_dat_content(npz_bytes: bytes) -> str:
+    import io
+    import numpy as np
+    
+    with np.load(io.BytesIO(npz_bytes), allow_pickle=True) as data:
+        a = data.get("a_locations")
+        if a is None:
+            a = data.get("a")
+        b = data.get("b_locations")
+        if b is None:
+            b = data.get("b")
+        m = data.get("m_locations")
+        if m is None:
+            m = data.get("m")
+        n = data.get("n_locations")
+        if n is None:
+            n = data.get("n")
+            
+        if a is None or m is None:
+            raise ValueError("NPZ数据文件中缺少必要的电极位置数据(a_locations, m_locations)")
+            
+        n_obs = len(a)
+        
+        rhoa = data.get("apparent_resistivity")
+        if rhoa is None:
+            rhoa = data.get("rhoa")
+        if rhoa is None:
+            dobs = data.get("dobs")
+            if dobs is None:
+                dobs = data.get("resistivity")
+            if dobs is None:
+                dobs = data.get("data")
+            if dobs is not None:
+                k = data.get("geometric_factor")
+                if k is not None:
+                    rhoa = dobs * k
+                else:
+                    rhoa = dobs
+            else:
+                raise ValueError("NPZ数据文件中缺少电阻率或电阻数据")
+                
+        error = data.get("error")
+        if error is None:
+            error = data.get("standard_deviation")
+        if error is None:
+            error = data.get("std")
+            
+        all_x = []
+        for arr in [a, b, m, n]:
+            if arr is not None:
+                for pt in arr:
+                    if pt is not None and not np.any(np.isnan(pt)):
+                        x = pt[0]
+                        if abs(x - 999999) > 1 and abs(x + 999999) > 1:
+                            all_x.append(x)
+        if len(all_x) > 1:
+            all_x = sorted(list(set(all_x)))
+            diffs = [all_x[i+1] - all_x[i] for i in range(len(all_x)-1)]
+            unit_spacing = min(diffs) if diffs else 1.0
+        else:
+            unit_spacing = 1.0
+            
+        if unit_spacing <= 0:
+            unit_spacing = 1.0
+            
+        out_lines = []
+        out_lines.append("NPZ Imported Data")
+        out_lines.append(f"{unit_spacing:.3f}")
+        out_lines.append("11")  # General array
+        out_lines.append(f"{n_obs}")
+        out_lines.append("0")   # x_location_type
+        out_lines.append("0")   # ip_flag
+        
+        for i in range(n_obs):
+            ax = a[i][0]
+            az = a[i][2] if len(a[i]) > 2 else a[i][1]
+            
+            if b is not None and i < len(b) and b[i] is not None and not np.any(np.isnan(b[i])):
+                bx = b[i][0]
+                bz = b[i][2] if len(b[i]) > 2 else b[i][1]
+                if abs(bx - 999999) < 1 or abs(bx + 999999) < 1:
+                    bx, bz = 999999.0, 0.0
+            else:
+                bx, bz = 999999.0, 0.0
+                
+            mx = m[i][0]
+            mz = m[i][2] if len(m[i]) > 2 else m[i][1]
+            
+            if n is not None and i < len(n) and n[i] is not None and not np.any(np.isnan(n[i])):
+                nx = n[i][0]
+                nz = n[i][2] if len(n[i]) > 2 else n[i][1]
+                if abs(nx - 999999) < 1 or abs(nx + 999999) < 1:
+                    nx, nz = 999999.0, 0.0
+            else:
+                nx, nz = 999999.0, 0.0
+                
+            r_val = float(rhoa[i])
+            err_str = ""
+            if error is not None and i < len(error) and error[i] is not None:
+                err_str = f" {float(error[i]):.6f}"
+                
+            out_lines.append(f"{ax:.3f} {az:.3f} {bx:.3f} {bz:.3f} {mx:.3f} {mz:.3f} {nx:.3f} {nz:.3f} {r_val:.4f}{err_str}")
+            
+        return "\n".join(out_lines) + "\n"
+
+
+def _extract_points_from_observations(observations) -> list[tuple[float, float, float]]:
+    points = []
+    for d in observations:
+        xs = []
+        zs = []
+        
+        xs.append(d.ax)
+        zs.append(d.az)
+        
+        if d.bx is not None and abs(d.bx - 999999) > 1 and abs(d.bx + 999999) > 1:
+            xs.append(d.bx)
+            zs.append(d.bz if d.bz is not None else 0.0)
+            
+        xs.append(d.mx)
+        zs.append(d.mz)
+        
+        if d.nx is not None and abs(d.nx - 999999) > 1 and abs(d.nx + 999999) > 1:
+            xs.append(d.nx)
+            zs.append(d.nz if d.nz is not None else 0.0)
+            
+        x = sum(xs) / len(xs) if xs else 0.0
+        
+        if xs:
+            l_span = max(xs) - min(xs)
+        else:
+            l_span = 0.0
+        depth = l_span / 4.0
+        
+        z_mean = sum(zs) / len(zs) if zs else 0.0
+        z = z_mean - depth
+        
+        points.append((x, z, d.apparent_resistivity))
+    return points
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _run_local_ert_subprocess(task_id: str, task_payload: Dict[str, Any]) -> None:
-    _dequeue_task(task_id)
-    _LOCAL_ERT_TASK_RESULTS[task_id].update(
-        {
-            "status": "running",
-            "started_at": _utc_now(),
-            "progress": {
-                "current": 0,
-                "total": int(task_payload.get("max_iter") or 1),
-                "percent": 10,
-                "message": "正在准备反演数据",
-                "logs": ["任务已启动，正在准备反演数据..."],
-            },
-        }
-    )
-    output_dir = Path(str(task_payload["output_dir"]))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    payload_path = output_dir / "local_ert_payload.json"
-    result_path = output_dir / "local_ert_result.json"
-    payload_path.write_text(json.dumps(task_payload, ensure_ascii=False), encoding="utf-8")
-
-    code = r"""
-import json
-import os
-import sys
-from pathlib import Path
-
-os.environ.setdefault("MPLBACKEND", "Agg")
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-from backend.app.services.pygimli_ert import run_pygimli_inversion
-from backend.app.services.simpeg_ert import run_simpeg_inversion
-
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-result_path = Path(sys.argv[2])
-output_dir = Path(str(payload["output_dir"]))
-output_dir.mkdir(parents=True, exist_ok=True)
-data_file_path = Path(str(payload["data_file_path"]))
-if not data_file_path.is_file():
-    raise FileNotFoundError(f"ERT input file missing: {data_file_path}")
-terrain_file_path = None
-terrain_value = payload.get("terrain_file_path")
-if terrain_value:
-    candidate = Path(str(terrain_value))
-    if candidate.is_file():
-        terrain_file_path = candidate
-
-backend = str(payload.get("inversion_backend") or "pygimli").lower()
-if backend == "simpeg":
-    result = run_simpeg_inversion(
-        data_file_path=str(data_file_path),
-        output_dir=str(output_dir),
-        z_weight=float(payload.get("z_weight", 0.2)),
-        max_iter=int(payload.get("max_iter", 20)),
-        lambda_param=int(payload.get("lambda_param", 20)),
-        error=float(payload.get("error", 0.03)),
-        terrain_file_path=str(terrain_file_path) if terrain_file_path else None,
-    )
-else:
-    result = run_pygimli_inversion(
-        data_file_path=str(data_file_path),
-        output_dir=str(output_dir),
-        z_weight=float(payload.get("z_weight", 0.2)),
-        max_iter=int(payload.get("max_iter", 20)),
-        lambda_param=int(payload.get("lambda_param", 20)),
-        error=float(payload.get("error", 0.03)),
-        terrain_file_path=str(terrain_file_path) if terrain_file_path else None,
-    )
-result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-"""
-
-    process: Optional[subprocess.Popen] = None
-    timed_out = {"flag": False}
-    watchdog: Optional[threading.Timer] = None
-
-    try:
-        popen_kwargs: Dict[str, Any] = dict(
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env={
-                **os.environ,
-                "MPLBACKEND": "Agg",
-                "QT_QPA_PLATFORM": "offscreen",
-                "PYTHONIOENCODING": "utf-8",
-            },
-        )
-        # Group child process so we can kill the whole tree on timeout
-        # (matters if pyGIMLi/SimPEG fork helper workers).
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            popen_kwargs["start_new_session"] = True
-
-        process = subprocess.Popen(
-            [sys.executable, "-c", code, str(payload_path), str(result_path)],
-            cwd=str(Path(__file__).resolve().parents[3]),
-            **popen_kwargs,
-        )
-        assert process.stdout is not None
-
-        def _on_timeout() -> None:
-            if process and process.poll() is None:
-                timed_out["flag"] = True
-                _append_task_log(
-                    task_id,
-                    f"⚠️ 任务执行已超过 {_ERT_INVERSION_TIMEOUT_SECONDS // 60} 分钟，正在终止子进程...",
-                )
-                _terminate_subprocess_tree(process)
-
-        watchdog = threading.Timer(_ERT_INVERSION_TIMEOUT_SECONDS, _on_timeout)
-        watchdog.daemon = True
-        watchdog.start()
-
-        for output_line in process.stdout:
-            _append_task_log(task_id, output_line)
-        return_code = process.wait()
-
-        if timed_out["flag"]:
-            raise RuntimeError(
-                f"二维反演超时（超过 {_ERT_INVERSION_TIMEOUT_SECONDS // 60} 分钟），已自动终止子进程。"
-                "请减小数据规模或调低最大迭代次数后重试。"
-            )
-        if return_code != 0:
-            error = "\n".join(_LOCAL_ERT_TASK_RESULTS[task_id].get("logs", []))
-            raise RuntimeError(_summarize_ert_error(error))
-        result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
-        logs = _LOCAL_ERT_TASK_RESULTS[task_id].get("logs", [])
-        _LOCAL_ERT_TASK_RESULTS[task_id].update(
-            {
-                "status": "success",
-                "result": result,
-                "progress": {
-                    "current": int(task_payload.get("max_iter") or 1),
-                    "total": int(task_payload.get("max_iter") or 1),
-                    "percent": 100,
-                    "message": "二维反演完成",
-                    "logs": list(logs),
-                },
-                "finished_at": _utc_now(),
-            }
-        )
-    except Exception as exc:
-        logs = _LOCAL_ERT_TASK_RESULTS[task_id].get("logs", [])
-        _LOCAL_ERT_TASK_RESULTS[task_id].update(
-            {
-                "status": "failed",
-                "error": _summarize_ert_error(str(exc)),
-                "progress": {
-                    "current": 1,
-                    "total": int(task_payload.get("max_iter") or 1),
-                    "percent": 100,
-                    "message": "二维反演超时已终止" if timed_out["flag"] else "二维反演失败",
-                    "logs": list(logs),
-                },
-                "finished_at": _utc_now(),
-            }
-        )
-    finally:
-        if watchdog is not None:
-            watchdog.cancel()
-        # Defensive: if the loop above exited via an unexpected exception
-        # (e.g., disk full when reading stdout), make sure we don't leak the child.
-        if process is not None and process.poll() is None:
-            _terminate_subprocess_tree(process)
-
-
-def _start_local_ert_task(task_payload: Dict[str, Any]) -> str:
-    local_task_id = f"local-{uuid.uuid4()}"
-    now = _utc_now()
-    position, total = _enqueue_task(local_task_id)
-    if position <= 1:
-        message = "任务已提交，即将开始计算..."
-    else:
-        message = f"任务排队中：第 {position}/{total} 位，前面还有 {position - 1} 个任务"
-    _LOCAL_ERT_TASK_RESULTS[local_task_id] = {
-        "status": "queued",
-        "created_at": now,
-        "started_at": None,
-        "finished_at": None,
-        "max_iter": int(task_payload.get("max_iter") or 1),
-        "logs": [message],
-        "progress": {
-            "current": 0,
-            "total": int(task_payload.get("max_iter") or 1),
-            "percent": 0,
-            "message": message,
-            "logs": [message],
-            "queue_position": position,
-            "queue_total": total,
-        },
-    }
-    _LOCAL_ERT_EXECUTOR.submit(_run_local_ert_subprocess, local_task_id, task_payload)
-    return local_task_id
 
 
 def _stream_upload_to_disk(upload: UploadFile, target: Path) -> int:
@@ -543,9 +468,89 @@ def download_local_ert_input_file(
     )
 
 
+@router.post("/parse-data-file")
+def parse_ert_data_file(
+    data_file: UploadFile = File(..., description="ERT data file (.dat, .shm, or .npz)"),
+    _: User = Depends(get_current_admin_user),
+):
+    if not data_file.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="缺少文件名",
+        )
+    
+    try:
+        content_bytes = data_file.file.read()
+        # 限制上传大小
+        if len(content_bytes) > _ERT_MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="文件太大，超出限制",
+            )
+            
+        filename = data_file.filename.lower()
+        
+        # 转换为 .dat 格式文本
+        if filename.endswith(".npz"):
+            dat_content = parse_npz_to_dat_content(content_bytes)
+        else:
+            dat_content = content_bytes.decode("utf-8-sig", errors="replace")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"数据文件读取或转换失败：{exc}",
+        )
+        
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".dat", delete=False, encoding="utf-8") as temp_file:
+        temp_file.write(dat_content)
+        temp_file_path = temp_file.name
+        
+    try:
+        from ..services.res2dinv_to_simpeg import parse_res2dinv_dat
+        result = parse_res2dinv_dat(temp_file_path)
+        
+        points = _extract_points_from_observations(result.observations)
+        
+        from ..services.pygimli_ert import _parse_terrain_points_from_text
+        topography = _parse_terrain_points_from_text(dat_content)
+        
+        all_xs = set()
+        for d in result.observations:
+            all_xs.add(d.ax)
+            if d.bx is not None and abs(d.bx - 999999) > 1 and abs(d.bx + 999999) > 1:
+                all_xs.add(d.bx)
+            all_xs.add(d.mx)
+            if d.nx is not None and abs(d.nx - 999999) > 1 and abs(d.nx + 999999) > 1:
+                all_xs.add(d.nx)
+        electrode_count = len(all_xs)
+        
+        if all_xs:
+            profile_length = max(all_xs) - min(all_xs)
+        else:
+            profile_length = 0.0
+            
+        return {
+            "points": points,
+            "spacing": result.unit_spacing,
+            "electrode_count": electrode_count,
+            "profile_length": profile_length,
+            "topography": topography or None,
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"数据文件格式错误或无法解析：{exc}",
+        )
+    finally:
+        try:
+            os.unlink(temp_file_path)
+        except Exception:
+            pass
+
+
 @router.post("/invert", response_model=EMAP1TaskCreateResponse)
 def trigger_ert_inversion(
-    data_file: UploadFile = File(..., description="ERT data file (.dat or .shm)"),
+    data_file: UploadFile = File(..., description="ERT data file (.dat, .shm, or .npz)"),
     terrain_file: Optional[UploadFile] = File(None, description="Optional terrain/topography file"),
     output_dir: Optional[str] = Form(None),
     inversion_backend: Literal["pygimli", "simpeg"] = Form("pygimli"),
@@ -568,7 +573,24 @@ def trigger_ert_inversion(
     output_path.mkdir(parents=True, exist_ok=True)
 
     data_path = output_path / "input_data.dat"
-    written = _stream_upload_to_disk(data_file, data_path)
+    
+    # 拦截并转换 npz
+    if data_file.filename.lower().endswith(".npz"):
+        try:
+            npz_bytes = data_file.file.read()
+            data_file.file.seek(0)
+            dat_content = parse_npz_to_dat_content(npz_bytes)
+            with open(data_path, "w", encoding="utf-8") as f:
+                f.write(dat_content)
+            written = len(dat_content)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"解析上传的 NPZ 文件并转换为 DAT 失败: {exc}",
+            )
+    else:
+        written = _stream_upload_to_disk(data_file, data_path)
+
     if written == 0:
         data_path.unlink(missing_ok=True)
         raise HTTPException(
@@ -598,10 +620,17 @@ def trigger_ert_inversion(
         "max_iter": max_iter,
         "lambda_param": lambda_param,
         "error": error,
+        "created_at": _utc_now(),
     }
 
-    local_task_id = _start_local_ert_task(task_payload)
-    return EMAP1TaskCreateResponse(task_id=local_task_id, status="queued")
+    try:
+        async_result = run_ert_inversion_task.apply_async(args=[task_payload])
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"无法提交后台任务：{exc}",
+        ) from exc
+    return EMAP1TaskCreateResponse(task_id=async_result.id, status="queued")
 
 
 @router.get("/tasks/{task_id}", response_model=EMAP1TaskStatusResponse)
@@ -609,60 +638,57 @@ def get_ert_task_status(
     task_id: str,
     _: User = Depends(get_current_admin_user),
 ):
-    local_result = _LOCAL_ERT_TASK_RESULTS.get(task_id)
-    if local_result:
-        normalized_status = local_result["status"]
-        progress = dict(local_result.get("progress") or {})
-        progress.setdefault("current", 1 if normalized_status in {"success", "failed"} else 0)
-        progress.setdefault("total", int(local_result.get("max_iter") or 1))
-        progress.setdefault("percent", 100 if normalized_status in {"success", "failed"} else 10)
-        progress.setdefault(
-            "message",
-            "二维反演完成"
-            if normalized_status == "success"
-            else "二维反演失败"
-            if normalized_status == "failed"
-            else "二维反演计算中",
-        )
-        progress["logs"] = list(local_result.get("logs") or progress.get("logs") or [])
-
-        if normalized_status == "queued":
-            position, queue_total = _queue_position_for(task_id)
-            progress["queue_position"] = position
-            progress["queue_total"] = queue_total
-            if position is not None and queue_total is not None:
-                if position <= 1:
-                    progress["message"] = "即将开始计算..."
-                else:
-                    progress["message"] = (
-                        f"任务排队中：第 {position}/{queue_total} 位，"
-                        f"前面还有 {position - 1} 个任务"
-                    )
-        else:
-            progress["queue_position"] = None
-            progress["queue_total"] = None
-
-        return EMAP1TaskStatusResponse(
-            task_id=task_id,
-            status=normalized_status,
-            progress=progress,
-            error=local_result.get("error"),
-            created_at=local_result.get("created_at"),
-            started_at=local_result.get("started_at"),
-            finished_at=local_result.get("finished_at"),
-        )
-
     async_result = AsyncResult(task_id, app=celery_app)
     normalized_status = _normalize_status(async_result.state)
     meta = _extract_meta(async_result)
+
+    task_data = async_result.result if async_result.state == "SUCCESS" else meta
+    if not isinstance(task_data, dict):
+        task_data = {}
+
+    progress = dict(task_data.get("progress") or {})
+    progress.setdefault("current", 1 if normalized_status in {"success", "failed"} else 0)
+    progress.setdefault("total", int(task_data.get("max_iter") or 1))
+    progress.setdefault("percent", 100 if normalized_status in {"success", "failed"} else 10)
+    progress.setdefault(
+        "message",
+        "二维反演完成"
+        if normalized_status == "success"
+        else "二维反演失败"
+        if normalized_status == "failed"
+        else "二维反演计算中",
+    )
+    progress["logs"] = list(task_data.get("logs") or progress.get("logs") or [])
+
+    inversion_backend = str(task_data.get("inversion_backend") or "").lower()
+    if inversion_backend == "simpeg":
+        iteration_results = _load_live_simpeg_iteration_results(task_data)
+        if iteration_results:
+            latest_iteration = iteration_results[-1]
+            latest_index = int(latest_iteration.get("iteration") or len(iteration_results))
+            progress["iteration_results"] = iteration_results
+            progress["latest_iteration_result"] = latest_iteration
+            progress["current"] = max(int(progress.get("current") or 0), latest_index)
+            progress["message"] = f"正在进行第 {latest_index}/{progress.get('total') or task_data.get('max_iter') or 1} 次迭代"
+    elif inversion_backend == "pygimli":
+        iteration_results = _load_live_pygimli_iteration_results(task_data)
+        if iteration_results:
+            latest_iteration = iteration_results[-1]
+            latest_index = int(latest_iteration.get("iteration") or len(iteration_results))
+            progress["iteration_results"] = iteration_results
+            progress["latest_iteration_result"] = latest_iteration
+            progress["current"] = max(int(progress.get("current") or 0), latest_index)
+            progress["message"] = f"正在进行第 {latest_index}/{progress.get('total') or task_data.get('max_iter') or 1} 次迭代"
+
+
     return EMAP1TaskStatusResponse(
         task_id=task_id,
         status=normalized_status,
-        progress=_progress_from_meta(meta, normalized_status),
-        error=meta.get("error"),
-        created_at=meta.get("created_at"),
-        started_at=meta.get("started_at"),
-        finished_at=meta.get("finished_at"),
+        progress=progress,
+        error=task_data.get("error") or (meta.get("error") if isinstance(meta, dict) else None),
+        created_at=task_data.get("created_at"),
+        started_at=task_data.get("started_at"),
+        finished_at=task_data.get("finished_at"),
     )
 
 
@@ -671,17 +697,6 @@ def get_ert_task_result(
     task_id: str,
     _: User = Depends(get_current_admin_user),
 ):
-    local_result = _LOCAL_ERT_TASK_RESULTS.get(task_id)
-    if local_result:
-        if local_result["status"] in {"queued", "running"}:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="任务尚未完成")
-        if local_result["status"] == "failed":
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=local_result.get("error") or "任务执行失败",
-            )
-        return local_result.get("result") or {}
-
     async_result = AsyncResult(task_id, app=celery_app)
     normalized_status = _normalize_status(async_result.state)
     meta = _extract_meta(async_result)
@@ -709,13 +724,23 @@ def archive_ert_task_result(
     payload: ERTArchiveRequest,
     _: User = Depends(get_current_admin_user),
 ):
-    local_result = _LOCAL_ERT_TASK_RESULTS.get(task_id)
-    if not local_result:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ERT task not found")
-    if local_result.get("status") != "success":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="ERT task is not finished")
+    async_result = AsyncResult(task_id, app=celery_app)
+    normalized_status = _normalize_status(async_result.state)
+    meta = _extract_meta(async_result)
 
-    result = local_result.get("result") or {}
+    if normalized_status in {"queued", "running"}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="任务尚未完成")
+    if normalized_status in {"failed", "revoked"} or async_result.state != "SUCCESS":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="任务尚未完成或执行失败")
+
+    task_payload = async_result.result
+    if not isinstance(task_payload, dict) or "result" not in task_payload:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="任务结果格式无效",
+        )
+
+    result = task_payload.get("result") or {}
     existing_files = _existing_ert_result_files(result)
     if not existing_files:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No ERT result files found")
@@ -726,6 +751,9 @@ def archive_ert_task_result(
     folder_token = _safe_path_part(folder_name, "ert_result")
     target_dir = _ERT_ARCHIVE_ROOT / project_token / folder_token
     target_dir.mkdir(parents=True, exist_ok=True)
+    for stale_path in target_dir.iterdir():
+        if stale_path.is_file():
+            stale_path.unlink(missing_ok=True)
 
     archived_files = []
     for source_path in existing_files:
@@ -753,6 +781,29 @@ def archive_ert_task_result(
         "archive_dir": str(target_dir),
         "files": archived_files,
     }
+
+
+@router.get("/archive-files/{project_token}/{folder_token}/{file_name}/preview")
+def preview_ert_archive_file(
+    project_token: str,
+    folder_token: str,
+    file_name: str,
+    _: User = Depends(get_current_admin_user),
+):
+    target = _resolve_archive_file(
+        _safe_path_part(project_token, "project"),
+        _safe_path_part(folder_token, "ert_result"),
+        _safe_path_part(file_name, "file"),
+    )
+    if target.suffix.lower() != ".npz":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only SimPEG npz previews are supported")
+
+    try:
+        from ..services.simpeg_ert import build_simpeg_preview_from_npz
+
+        return build_simpeg_preview_from_npz(target)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
 
 
 @router.get("/archive-files/{project_token}/{folder_token}/{file_name}")

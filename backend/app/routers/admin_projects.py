@@ -331,7 +331,7 @@ def delete_project(
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="?????")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
     if not _check_project_permission(project, admin_user, min_role="owner"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="当前角色无权删除项目")
 

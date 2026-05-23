@@ -688,6 +688,9 @@ class EMAP1TaskProgress(BaseModel):
     logs: List[str] = Field(default_factory=list)
     queue_position: Optional[int] = None
     queue_total: Optional[int] = None
+    iteration_results: Optional[List[dict]] = None
+    latest_iteration_result: Optional[dict] = None
+
 
 
 class EMAP1TaskStatusResponse(BaseModel):

@@ -1,7 +1,106 @@
-﻿import React, { useState, useEffect, useRef } from 'react';
+﻿import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { X, Play, Loader, Settings2, FileText } from 'lucide-react';
 import { requestAdminApi } from '../../../services/apiClient';
 import { resolveDriveFileContent } from '../../../utils/driveFileContent';
+import LazyECharts from '../../../components/LazyECharts';
+
+const buildFitChartOption = (fit) => {
+  if (!fit || !Array.isArray(fit.obs) || !Array.isArray(fit.pred) || fit.obs.length === 0) {
+    return null;
+  }
+  const n = Math.min(fit.obs.length, fit.pred.length);
+  const obs = fit.obs.slice(0, n);
+  const pred = fit.pred.slice(0, n);
+  const misfit = (fit.misfit_pct || []).slice(0, n);
+  const indices = Array.from({ length: n }, (_, i) => i + 1);
+
+  return {
+    animation: false,
+    grid: [
+      { left: 60, right: 24, top: 36, height: '52%' },
+      { left: 60, right: 24, top: '68%', bottom: 48 },
+    ],
+    legend: {
+      data: ['观测 ρa', '预测 ρa', '相对偏差'],
+      top: 4,
+    },
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'cross' },
+      formatter: (params) => {
+        if (!params?.length) return '';
+        const idx = params[0].dataIndex;
+        const o = obs[idx];
+        const p = pred[idx];
+        const m = misfit[idx];
+        return [
+          `数据点 #${idx + 1}`,
+          `观测 ρa: ${Number.isFinite(o) ? o.toFixed(3) : '--'} Ω·m`,
+          `预测 ρa: ${Number.isFinite(p) ? p.toFixed(3) : '--'} Ω·m`,
+          `相对偏差: ${Number.isFinite(m) ? m.toFixed(2) : '--'} %`,
+        ].join('<br/>');
+      },
+    },
+    xAxis: [
+      { type: 'category', gridIndex: 0, data: indices, axisLabel: { show: false }, axisTick: { show: false } },
+      { type: 'category', gridIndex: 1, data: indices, name: '数据点序号', nameLocation: 'middle', nameGap: 28 },
+    ],
+    yAxis: [
+      { type: 'log', gridIndex: 0, name: 'ρa (Ω·m)', nameLocation: 'middle', nameGap: 44, scale: true },
+      { type: 'value', gridIndex: 1, name: '相对偏差 (%)', nameLocation: 'middle', nameGap: 44 },
+    ],
+    series: [
+      {
+        name: '观测 ρa',
+        type: 'scatter',
+        xAxisIndex: 0,
+        yAxisIndex: 0,
+        data: obs,
+        symbolSize: 5,
+        itemStyle: { color: '#0ea5e9' },
+      },
+      {
+        name: '预测 ρa',
+        type: 'line',
+        xAxisIndex: 0,
+        yAxisIndex: 0,
+        data: pred,
+        showSymbol: false,
+        smooth: false,
+        lineStyle: { color: '#ef4444', width: 1.5 },
+      },
+      {
+        name: '相对偏差',
+        type: 'bar',
+        xAxisIndex: 1,
+        yAxisIndex: 1,
+        data: misfit,
+        itemStyle: {
+          color: (params) => (Number(params.value) >= 0 ? '#ef4444' : '#3b82f6'),
+        },
+        barWidth: '80%',
+      },
+    ],
+  };
+};
+
+const FitComparisonChart = ({ fit }) => {
+  const option = useMemo(() => buildFitChartOption(fit), [fit]);
+  if (!option) return null;
+  const n = fit?.n ?? fit?.obs?.length ?? 0;
+  const rms = Number.isFinite(fit?.rms_pct) ? fit.rms_pct.toFixed(2) : '--';
+  return (
+    <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: '8px', padding: '12px 12px 8px' }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: '8px' }}>
+        <strong style={{ fontSize: '0.95rem', color: '#0f172a' }}>观测 vs 预测 视电阻率</strong>
+        <span style={{ fontSize: '0.8rem', color: '#64748b' }}>
+          数据点: {n}　·　相对偏差 RMS: {rms}%
+        </span>
+      </div>
+      <LazyECharts option={option} style={{ width: '100%', height: 380 }} notMerge lazyUpdate />
+    </div>
+  );
+};
 
 const coerceResolvedFileToBlob = (resolvedFile, fallbackName = 'data.dat') => {
   if (resolvedFile instanceof File) return resolvedFile;
@@ -424,7 +523,9 @@ const ErtInversionModal = ({ isOpen, onClose, file, onSuccess, onTaskStarted }) 
                   <span>地形: <strong>{resultData.terrain_used ? `${resultData.terrain_point_count || 0} 点` : '未使用'}</strong></span>
                 </div>
               </div>
-              
+
+              <FitComparisonChart fit={resultData.fit_comparison} />
+
               <div style={{ fontSize: '0.875rem', color: '#475569' }}>
                 <p style={{ margin: '0 0 8px 0', fontWeight: 500 }}>输出文件已生成：</p>
                 <div style={{

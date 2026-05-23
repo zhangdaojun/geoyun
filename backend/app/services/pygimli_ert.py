@@ -25,7 +25,63 @@ ERT_RESULT_SUFFIXES = {
     ".vector",
     ".vtk",
     ".xyz",
+    ".npz",
 }
+
+
+def _build_pygimli_fit_comparison(manager, data) -> dict[str, Any] | None:
+    """Extract observed vs predicted apparent resistivity for the fit chart.
+
+    Returns None if arrays cannot be aligned. `manager.inv.response` is the
+    forward response in the data-vector space; for ERTManager defaulting to
+    apparent resistivity, this is rhoa. We fall back to multiplying by the
+    geometric factor `k` when the response magnitudes look like resistance.
+    """
+    try:
+        obs = [float(v) for v in data("rhoa")]
+        response = list(manager.inv.response)
+        pred = [float(v) for v in response]
+        n = min(len(obs), len(pred))
+        if n == 0:
+            return None
+        obs = obs[:n]
+        pred = pred[:n]
+
+        # Heuristic: if predicted magnitudes are far below observed, response
+        # is likely resistance and needs k to become apparent resistivity.
+        obs_med = sorted(v for v in obs if math.isfinite(v) and v > 0)
+        pred_med = sorted(v for v in pred if math.isfinite(v) and v > 0)
+        if obs_med and pred_med:
+            o_mid = obs_med[len(obs_med) // 2]
+            p_mid = pred_med[len(pred_med) // 2]
+            if p_mid > 0 and (o_mid / p_mid > 10 or p_mid / o_mid > 10) and data.haveData("k"):
+                k_values = [float(v) for v in data("k")]
+                pred = [pred[i] * k_values[i] for i in range(n)]
+
+        misfit_pct = []
+        sq_sum = 0.0
+        sq_count = 0
+        for o, p in zip(obs, pred):
+            if math.isfinite(o) and math.isfinite(p) and abs(o) > 1e-12:
+                rel = (p - o) / o * 100.0
+                misfit_pct.append(rel)
+                sq_sum += rel * rel
+                sq_count += 1
+            else:
+                misfit_pct.append(0.0)
+        rms_pct = math.sqrt(sq_sum / sq_count) if sq_count else 0.0
+
+        return {
+            "obs": obs,
+            "pred": pred,
+            "misfit_pct": misfit_pct,
+            "rms_pct": rms_pct,
+            "n": n,
+            "unit": "ohm_m",
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Unable to build pyGIMLi fit comparison: %s", exc)
+        return None
 
 
 def _finite_positive_values(values) -> list[float]:
@@ -193,6 +249,36 @@ def _extract_vtk_cell_resistivity_points(vtk_path: str | Path) -> list[tuple[flo
         if math.isfinite(x) and math.isfinite(y) and math.isfinite(value):
             output.append((x, y, value))
     return output
+
+
+def _extract_vtk_polygon_mesh(vtk_path: str | Path) -> dict[str, Any] | None:
+    points, cells, resistivity_values = _extract_vtk_points_cells_and_resistivity(vtk_path)
+
+    mesh_cells: list[dict[str, Any]] = []
+    for cell, resistivity in zip(cells, resistivity_values):
+        value = float(resistivity)
+        vertices = [points[point_index] for point_index in cell if 0 <= point_index < len(points)]
+        polygon = [
+            [float(vertex[0]), float(vertex[1])]
+            for vertex in vertices
+            if math.isfinite(float(vertex[0])) and math.isfinite(float(vertex[1]))
+        ]
+        if len(polygon) >= 3 and math.isfinite(value) and value > 0:
+            mesh_cells.append({"points": polygon, "rho": value})
+
+    if not mesh_cells:
+        return None
+    x_values = [point[0] for cell in mesh_cells for point in cell["points"]]
+    y_values = [point[1] for cell in mesh_cells for point in cell["points"]]
+    return {
+        "cells": mesh_cells,
+        "bounds": {
+            "xMin": min(x_values),
+            "xMax": max(x_values),
+            "yMin": min(y_values),
+            "yMax": max(y_values),
+        },
+    }
 
 
 def _extract_vtk_node_resistivity_points(vtk_path: str | Path) -> list[tuple[float, float, float]]:
@@ -583,6 +669,7 @@ def _save_iteration_model_snapshot(
             "iteration": int(iteration_index),
             "vector": str(vector_path),
             "vtk": str(vtk_path),
+            "vtk_mesh": _extract_vtk_polygon_mesh(vtk_path),
             "preview_points": _extract_vtk_cell_resistivity_points(vtk_path),
             "mesh_node_points": _extract_vtk_node_resistivity_points(vtk_path),
             "surfer_preview_points": surfer_preview_points,
@@ -1051,6 +1138,7 @@ def run_pygimli_inversion(
         for vtk_path in Path(output_dir).rglob("resistivity.vtk"):
             try:
                 surfer_outputs = _create_surfer_outputs_from_vtk(vtk_path)
+                surfer_outputs["vtk_mesh"] = _extract_vtk_polygon_mesh(vtk_path)
                 surfer_outputs["preview_points"] = _extract_vtk_cell_resistivity_points(vtk_path)
                 surfer_outputs["mesh_node_points"] = _extract_vtk_node_resistivity_points(vtk_path)
                 surfer_outputs["surfer_preview_points"] = _read_surfer_ascii_grid_points(surfer_outputs.get("grid") or "")
@@ -1073,10 +1161,13 @@ def run_pygimli_inversion(
         chi2 = manager.inv.getChi2() if hasattr(manager, "inv") and hasattr(manager.inv, "getChi2") else 0.0
         rrms = manager.inv.relrms() if hasattr(manager, "inv") and hasattr(manager.inv, "relrms") else 0.0
 
+        fit_comparison = _build_pygimli_fit_comparison(manager, data)
+
         return {
             "status": "success",
             "chi2": float(chi2),
             "rrms": float(rrms),
+            "fit_comparison": fit_comparison,
             "output_dir": output_dir,
             "terrain_used": bool(terrain_points),
             "terrain_point_count": len(terrain_points),
@@ -1085,6 +1176,7 @@ def run_pygimli_inversion(
             "surfer_macro_script": surfer_outputs.get("script"),
             "surfer_readme": surfer_outputs.get("readme"),
             "surfer_macro_error": surfer_outputs.get("macro_error"),
+            "vtk_mesh": surfer_outputs.get("vtk_mesh"),
             "preview_points": surfer_outputs.get("preview_points") or [],
             "mesh_node_points": surfer_outputs.get("mesh_node_points") or [],
             "surfer_preview_points": surfer_outputs.get("surfer_preview_points") or [],

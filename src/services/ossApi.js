@@ -11,6 +11,20 @@ export const getOssUploadPolicy = async (projectId, fileName) => (
   )
 );
 
+export const getOssUploadPolicies = async (projectId, fileNames = []) => (
+  requestAdminApi(
+    '/oss/upload-policies',
+    null,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        project_id: projectId,
+        file_names: fileNames,
+      }),
+    }
+  )
+);
+
 export const getOssDownloadUrl = async (objectKey) => {
   const result = await requestAdminApi(
     `/oss/download-url${buildQueryString({ object_key: objectKey })}`,
@@ -28,7 +42,7 @@ const createAbortError = () => {
 
 const isAbortError = (error) => error?.name === 'AbortError';
 
-const uploadFileToOssOnce = (file, policyData, onProgress, signal) => {
+const uploadFileToOssOnce = (file, policyData, onProgress, signal, timeoutMs = 10 * 60 * 1000) => {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(createAbortError());
@@ -45,6 +59,7 @@ const uploadFileToOssOnce = (file, policyData, onProgress, signal) => {
 
     const xhr = new XMLHttpRequest();
     xhr.open('POST', policyData.host, true);
+    xhr.timeout = timeoutMs;
 
     const cleanupAbortListener = () => {
       signal?.removeEventListener?.('abort', handleAbort);
@@ -77,6 +92,11 @@ const uploadFileToOssOnce = (file, policyData, onProgress, signal) => {
       reject(new Error('OSS upload network error'));
     };
 
+    xhr.ontimeout = () => {
+      cleanupAbortListener();
+      reject(new Error('OSS upload timed out'));
+    };
+
     xhr.onabort = () => {
       cleanupAbortListener();
       reject(createAbortError());
@@ -92,7 +112,7 @@ export const uploadFileToOss = async (file, policyData, onProgress, options = {}
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      await uploadFileToOssOnce(file, policyData, onProgress, options.signal);
+      await uploadFileToOssOnce(file, policyData, onProgress, options.signal, options.timeoutMs);
       return;
     } catch (error) {
       lastError = error;

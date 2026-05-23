@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { updateProjectWithCloudItems } from '../../../utils/projectModel';
 
 const mergeDriveFileItem = (localItem = {}, remoteItem = {}) => {
@@ -29,6 +29,39 @@ const mergeDriveFileItem = (localItem = {}, remoteItem = {}) => {
   return merged;
 };
 
+const getIterationIndexFromName = (name = '') => {
+  const match = String(name || '').match(/^iteration_(\d{3})(?:_|\.|$)/i);
+  if (!match) return null;
+  const index = Number(match[1]);
+  return Number.isFinite(index) ? index : null;
+};
+
+const getIterationFolderName = (index) => (
+  Number(index) === 0 ? '初始模型' : `第 ${Number(index)} 次迭代`
+);
+
+const groupFlatIterationFiles = (items = []) => {
+  const folderByParentAndName = new Map();
+  items.forEach((item) => {
+    if (item?.type !== 'folder') return;
+    folderByParentAndName.set(`${item.parentId || ''}\u001f${item.name || ''}`, item);
+  });
+
+  return items.map((item) => {
+    if (item?.type !== 'file') return item;
+    const iterationIndex = getIterationIndexFromName(item.name);
+    if (!Number.isFinite(iterationIndex)) return item;
+    const folderName = getIterationFolderName(iterationIndex);
+    const folder = folderByParentAndName.get(`${item.parentId || ''}\u001f${folderName}`);
+    if (!folder?.id || item.parentId === folder.id) return item;
+    return {
+      ...item,
+      parentId: folder.id,
+      iterationIndex
+    };
+  });
+};
+
 export const useDriveItems = ({
   localFileSystem,
   backendFolderItems,
@@ -41,9 +74,16 @@ export const useDriveItems = ({
   currentUser,
   suppressedDriveItemIds
 }) => {
+  const [optimisticState, setOptimisticState] = useState(null);
+
   const normalizedLocalItems = useMemo(
-    () => (Array.isArray(localFileSystem) ? localFileSystem : []),
-    [localFileSystem]
+    () => {
+      if (optimisticState?.source === localFileSystem && Array.isArray(optimisticState.items)) {
+        return optimisticState.items;
+      }
+      return Array.isArray(localFileSystem) ? localFileSystem : [];
+    },
+    [localFileSystem, optimisticState]
   );
 
   const fileSystem = useMemo(() => {
@@ -93,7 +133,7 @@ export const useDriveItems = ({
 
     remoteFolderByExternalId.forEach((item) => nextFileSystem.push(item));
     remoteByExternalId.forEach((item) => nextFileSystem.push(item));
-    return nextFileSystem;
+    return groupFlatIterationFiles(nextFileSystem);
   }, [
     backendFileItems,
     backendFolderItems,
@@ -103,7 +143,7 @@ export const useDriveItems = ({
     suppressedDriveItemIds
   ]);
 
-  const setFileSystem = (next, options = {}) => {
+  const setFileSystem = async (next, options = {}) => {
     const project = latestProjectRef.current;
     if (!project || !onUpdateProject) return;
     const {
@@ -114,6 +154,8 @@ export const useDriveItems = ({
       syncedDetail,
       errorTitle,
       errorDetail,
+      waitForSync = true,
+      silentSync = false,
       ...projectUpdateOptions
     } = options || {};
     const nextItems = typeof next === 'function' ? next(latestFileSystemRef.current || []) : next;
@@ -123,15 +165,39 @@ export const useDriveItems = ({
     });
     latestFileSystemRef.current = nextItems;
     latestProjectRef.current = nextProject;
-    return onUpdateProject(nextProject, {
-      syncSource,
-      syncTitle,
-      syncDetail,
-      syncedTitle,
-      syncedDetail,
-      errorTitle,
-      errorDetail
-    });
+    setOptimisticState({ source: localFileSystem, items: nextItems });
+    const syncMeta = syncSource && !silentSync
+      ? {
+          syncSource,
+          syncTitle,
+          syncDetail,
+          syncedTitle,
+          syncedDetail,
+          errorTitle,
+          errorDetail,
+          skipRefetch: true
+        }
+      : {};
+    const syncPromise = onUpdateProject(nextProject, syncMeta)
+      .then((savedProject) => {
+        setOptimisticState(null);
+        return savedProject;
+      })
+      .catch((error) => {
+        setOptimisticState(null);
+        latestProjectRef.current = project;
+        latestFileSystemRef.current = fileSystem;
+        throw error;
+      });
+
+    if (!waitForSync) {
+      syncPromise.catch((error) => {
+        console.warn('Failed to sync drive items to project backend', error);
+      });
+      return nextProject;
+    }
+
+    return syncPromise;
   };
 
   return {

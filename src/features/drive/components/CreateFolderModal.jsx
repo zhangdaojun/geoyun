@@ -20,6 +20,7 @@ const CreateFolderModal = ({
   const [folderName, setFolderName] = useState('');
   const [method, setMethod] = useState('');
   const [instrument, setInstrument] = useState('');
+  const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
@@ -28,6 +29,7 @@ const CreateFolderModal = ({
         : '';
       setFolderName('');
       setMethod(initialMethod);
+      setSubmitting(false);
       setInstrument(
         isCurrentFolderInRawTree
           ? (inheritedFolderRestriction?.instrumentLabel || instrumentOptionsByMethod[initialMethod]?.[0] || '')
@@ -38,9 +40,9 @@ const CreateFolderModal = ({
 
   if (!isOpen) return null;
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!canCreateFolder) return;
+    if (!canCreateFolder || submitting) return;
     if (!folderName.trim()) return;
 
     const surveyMethod = inheritedFolderRestriction?.surveyMethod || normalizeSurveyMethod(method);
@@ -62,12 +64,17 @@ const CreateFolderModal = ({
       }
     }
 
-    onSubmit({
-      name: folderName,
-      surveyMethod: surveyMethod || null,
-      instrumentLabel: instrumentLabel || null,
-      instrumentType: instrumentType || null
-    });
+    setSubmitting(true);
+    try {
+      await onSubmit({
+        name: folderName,
+        surveyMethod: surveyMethod || null,
+        instrumentLabel: instrumentLabel || null,
+        instrumentType: instrumentType || null
+      });
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (

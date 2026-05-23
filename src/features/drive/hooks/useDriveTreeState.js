@@ -1,14 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
-import { resolveTaskByFolderId, updateProjectWithNavigationLog } from '../../../utils/projectModel';
+import { resolveTaskByFolderId } from '../../../utils/projectModel';
 import { parseMTTSDisplayMeta } from '../driveFileRules';
 
 export const useDriveTreeState = ({
   selectedProject,
   fileSystem,
-  initialFolderId,
-  latestProjectRef,
-  onUpdateProject,
-  currentUser
+  initialFolderId
 }) => {
   const [currentFolderId, setCurrentFolderId] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
@@ -103,12 +100,6 @@ export const useDriveTreeState = ({
   const navigateToFolder = (folderId) => {
     setCurrentFolderId(folderId);
     setSearchTerm('');
-    const folder = fileSystem.find(item => item.id === folderId) || null;
-    const project = latestProjectRef.current || selectedProject;
-    if (!folderId || !folder || !onUpdateProject || !project) return;
-    onUpdateProject(updateProjectWithNavigationLog(project, folder.name, resolveTaskByFolderId(project, folderId)?.name || folder.taskName || '', {
-      actor: currentUser
-    }));
   };
 
   return {

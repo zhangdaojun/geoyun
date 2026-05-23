@@ -1,4 +1,4 @@
-﻿import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
   computeEh4CrosspowerSpectra,
   computeEh4CalibratedCrosspowersFromYFile,
@@ -93,7 +93,7 @@ const buildF3TimeSeriesBufferOneBasedChannels = () => {
 };
 
 describe('eh4Computation', () => {
-  it('F3 ??????? EH4 ???? ADC ????', () => {
+  it('F3 时序文件解析为 EH4 格式的 ADC 数据', () => {
     const blocks = parseF3TimeSeriesFile(buildF3TimeSeriesBuffer());
 
     expect(blocks).toHaveLength(1);
@@ -160,7 +160,7 @@ describe('eh4Computation', () => {
     expect(scalar.phaseX).toBeCloseTo(30, 1);
   });
 
-  it('??????????? EH4 Z ????????????', () => {
+  it('从交叉功率谱计算 EH4 Z 阻抗及视电阻率', () => {
     const row = {
       freq: 4,
       bw: 1,
@@ -227,7 +227,7 @@ describe('eh4Computation', () => {
     expect(row.rhoYX).toBeCloseTo(0.8, 6);
   });
 
-  it('EH4 ???????????????', () => {
+  it('EH4 频点合并时的相干度筛选和加权', () => {
     const highCoherencyRow = {
       freq: 10,
       bw: 1,
@@ -373,7 +373,7 @@ describe('eh4Computation', () => {
     expect(result.calibratedCrosspowers[0].freq).toBeCloseTo(4, 6);
   });
 
-  it('????????? X ??????? mV/km', () => {
+  it('标定后的电场通道 X 分量单位转换为 mV/km', () => {
     const [row] = applyEh4CalibrationToCrosspowers([{
       freq: 1,
       bw: 1,
@@ -453,7 +453,7 @@ describe('eh4Computation', () => {
     expect(tables.entries[0].coefficients[1].re).toBeCloseTo(0.000135, 9);
   });
 
-  it('???? 0x140 ????? K + 4 ????????', () => {
+  it('当寄存器 0x140 激活时应用 K + 4 倍电场标定系数', () => {
     const frequencies = [5];
     const sensorsText = [
       'hy.hf', 'ex.hf', 'hx.hf', 'ey.hf',
@@ -477,7 +477,7 @@ describe('eh4Computation', () => {
     expect(tables.entries[0].coefficients[0].re).toBeCloseTo(1350, 6);
   });
 
-  it('????? 0x682 ??????????', () => {
+  it('当寄存器 0x682 激活时正确标定磁场', () => {
     const frequencies = [5];
     const sensorsText = [
       'hy.hf', 'ex.hf', 'hx.hf', 'ey.hf',
@@ -535,7 +535,7 @@ describe('eh4Computation', () => {
     expect(result.algorithmResults.english.calibrationTables.method).toBe('english-manual');
   });
 
-  it('????????????? F3/Y blocks???? F3 ?????? Y ????', () => {
+  it('计算产品可直接使用已解析的 F3/Y blocks，避免把 F3 二进制当作旧 Y 文件重读', () => {
     const sampleRate = 64;
     const fftSize = 64;
     const frequency = 4;

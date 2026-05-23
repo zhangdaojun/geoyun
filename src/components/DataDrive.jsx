@@ -1,18 +1,13 @@
 ﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
 import JSZip from 'jszip';
 import { Folder, UploadCloud, FolderPlus, ChevronRight, XCircle } from 'lucide-react';
 import { getOssDownloadUrl } from '../services/ossApi';
 import { getToken } from '../services/tokenStore';
 import { findFileBlobByName, loadFileBlob } from '../utils/fileBlobStore';
 import { resolveDriveFileContent } from '../utils/driveFileContent';
-import {
-  canLogAdminFileOperations,
-  updateAdminFileRecord
-} from '../services/adminFileApi';
+import { updateAdminFileRecord } from '../services/adminFileApi';
 import { formatFileSizeBytes } from '../utils/fileUtils';
 import {
-  canUseAdminFoldersApi,
   deleteAdminFolder,
   updateAdminFolder,
   upsertAdminFolder
@@ -24,7 +19,7 @@ import DriveDirectoryView from '../features/drive/components/DriveDirectoryView'
 import DriveParserLauncher from '../features/drive/components/DriveParserLauncher';
 import CreateFolderModal from '../features/drive/components/CreateFolderModal';
 import ErtInversionModal from '../features/drive/components/ErtInversionModal';
-import { formatInstrumentLabel, normalizeInstrumentType, normalizeSurveyMethod } from '../features/drive/driveFileRules';
+import { formatInstrumentLabel } from '../features/drive/driveFileRules';
 import { useDriveBackendSync, parseFileSizeBytes } from '../features/drive/hooks/useDriveBackendSync';
 import { useDriveItems } from '../features/drive/hooks/useDriveItems';
 import { useDriveParserRoute } from '../features/drive/hooks/useDriveParserRoute';
@@ -36,8 +31,7 @@ import { triggerAdminAutoMatchViaApi } from '../services/adminProjectApi';
 /*
     正在加载解析器...
 */
-const DataDrive = ({ projects = [], selectedProject, onGoToProjects, onUpdateProject, initialFolderId = null, pendingPointRequest = null, appSettings, currentUser, projectSyncStatus = null }) => {
-  const { id: urlProjectId } = useParams();
+const DataDrive = ({ selectedProject, onGoToProjects, onUpdateProject, initialFolderId = null, pendingPointRequest = null, appSettings, currentUser, projectSyncStatus = null }) => {
   
   // Modals state
   const [showFolderPrompt, setShowFolderPrompt] = useState(false);
@@ -62,8 +56,8 @@ const DataDrive = ({ projects = [], selectedProject, onGoToProjects, onUpdatePro
   const backendProjectId = Number.isFinite(Number(selectedProject?.backendProjectId))
     ? Number(selectedProject?.backendProjectId)
     : null;
-  const shouldLogFileOperations = canLogAdminFileOperations(currentUser, selectedProject);
-  const shouldUseAdminFolders = canUseAdminFoldersApi(currentUser, selectedProject);
+  const shouldLogFileOperations = false;
+  const shouldUseAdminFolders = false;
 
   const {
     backendFileItems,
@@ -192,7 +186,7 @@ const DataDrive = ({ projects = [], selectedProject, onGoToProjects, onUpdatePro
     : uploadProgress?.total > 0
       ? Math.min(100, Math.round((((uploadProgress.completed || 0) + ((uploadProgress.currentPercent || 0) / 100)) / uploadProgress.total) * 100))
       : 0;
-  const showUploadProgress = Boolean(uploadProgress && uploadProgress.total > 1 && (
+  const showUploadProgress = Boolean(uploadProgress && uploadProgress.total > 0 && (
     uploadProgress.active ||
     String(uploadProgress.status || '').startsWith('finished') ||
     uploadProgress.status === 'stopped'
@@ -240,22 +234,43 @@ const DataDrive = ({ projects = [], selectedProject, onGoToProjects, onUpdatePro
     return () => window.clearTimeout(timer);
   }, [uploadProgress]);
 
-  const surveyItemsSignature = useMemo(() => (
-    normalizedLocalItems
+  const surveyItemsSignature = useMemo(() => {
+    const itemMap = new Map(normalizedLocalItems.map((item) => [String(item?.id || ''), item]));
+    const rawFolderIds = new Set(
+      normalizedLocalItems
+        .filter((item) => item?.type === 'folder')
+        .filter((item) => (
+          item.category === 'raw'
+          || item.taskName === '野外采集'
+          || item.name === '02_野外采集'
+        ))
+        .map((item) => String(item.id))
+    );
+    const isItemInsideRawTree = (item) => {
+      let cursor = item;
+      while (cursor) {
+        if (rawFolderIds.has(String(cursor.id || ''))) return true;
+        cursor = cursor?.parentId ? itemMap.get(String(cursor.parentId)) || null : null;
+      }
+      return false;
+    };
+    return normalizedLocalItems
+      .filter((item) => item?.type === 'file' && isItemInsideRawTree(item))
       .map((item) => [
         item?.id || '',
         item?.parentId || '',
-        item?.type || '',
         item?.name || '',
         item?.size || item?.fileSizeBytes || '',
         item?.storage_provider || item?.storageProvider || '',
         item?.object_key || item?.objectKey || '',
         item?.persisted_blob_id || item?.persistedBlobId || '',
-        item?.status || ''
+        item?.status || '',
+        item?.instrumentType || '',
+        item?.instrumentLabel || ''
       ].join('\u001f'))
       .sort()
-      .join('\u001e')
-  ), [normalizedLocalItems]);
+      .join('\u001e');
+  }, [normalizedLocalItems]);
 
   if (lastSurveyItemsRef.current !== surveyItemsSignature) {
     lastSurveyItemsRef.current = surveyItemsSignature;
@@ -263,7 +278,8 @@ const DataDrive = ({ projects = [], selectedProject, onGoToProjects, onUpdatePro
   }
 
   const surveySyncVersion = surveyItemsVersionRef.current;
-  const surveySyncKey = `${selectedProject?.id || ''}:${surveySyncVersion}`;
+  const surveySyncAuthState = getToken() ? 'auth' : 'no-auth';
+  const surveySyncKey = `${selectedProject?.id || ''}:${surveySyncVersion}:${surveySyncAuthState}`;
 
   useEffect(() => {
     const project = latestProjectRef.current;
@@ -273,6 +289,7 @@ const DataDrive = ({ projects = [], selectedProject, onGoToProjects, onUpdatePro
     void (async () => {
       try {
         const result = await syncDriveSurveyEntries(project, normalizedLocalItems);
+        const hasAdminToken = Boolean(getToken());
         const nextProject = result?.changed
           ? updateProjectWithPlan(project, {
               designEntries: result.designEntries,
@@ -282,17 +299,17 @@ const DataDrive = ({ projects = [], selectedProject, onGoToProjects, onUpdatePro
           : project;
 
         if (backendProjectId) {
+          if (!hasAdminToken) {
+            if (result?.changed) {
+              latestProjectRef.current = nextProject;
+            }
+            showBackendSyncFeedback('warning', '测线测点树未同步到后台', '当前缺少登录认证，请重新登录后再同步后台测线测点树。');
+            return;
+          }
           let syncedProject = nextProject;
           if (result?.changed) {
             latestProjectRef.current = nextProject;
-            syncedProject = await onUpdateProject(nextProject, {
-              syncSource: 'data-drive',
-              syncTitle: '正在同步测线测点树',
-              syncDetail: '正在根据最新网盘文件回刷项目数据库和测线测点树。',
-              syncedTitle: '网盘与测线测点树已同步',
-              syncedDetail: '当前网盘数据、项目数据库和测线测点树都已刷新到最新状态。',
-              errorTitle: '测线测点树同步失败'
-            });
+            syncedProject = await onUpdateProject(nextProject, { skipRefetch: true });
           }
           if (lastAdminMatchKeyRef.current !== surveySyncKey) {
             lastAdminMatchKeyRef.current = surveySyncKey;
@@ -306,14 +323,7 @@ const DataDrive = ({ projects = [], selectedProject, onGoToProjects, onUpdatePro
           // 如果没有使用后端项目（兼容本地旧逻辑）
           if (!result?.changed) return;
           latestProjectRef.current = nextProject;
-          await onUpdateProject(nextProject, {
-            syncSource: 'data-drive',
-            syncTitle: '正在同步测线测点树',
-            syncDetail: '正在根据最新网盘文件回刷项目数据库和测线测点树。',
-            syncedTitle: '网盘与测线测点树已同步',
-            syncedDetail: '当前网盘数据、项目数据库和测线测点树都已刷新到最新状态。',
-            errorTitle: '测线测点树同步失败'
-          });
+          await onUpdateProject(nextProject, { skipRefetch: true });
         }
       } catch (error) {
         console.warn('Failed to sync survey entries from drive items.', error);
@@ -321,12 +331,6 @@ const DataDrive = ({ projects = [], selectedProject, onGoToProjects, onUpdatePro
       }
     })();
   }, [surveySyncKey, surveySyncVersion, normalizedLocalItems, onUpdateProject, backendProjectId, currentUser, showBackendSyncFeedback]);
-
-  const surveyMethodOptions = ['大地电磁法', '高密度电法'];
-  const instrumentOptionsByMethod = {
-    '大地电磁法': ['F3', 'EH4', 'EDI', 'EMAP-1'],
-    '高密度电法': ['高密度电法']
-  };
 
   const rawFolderId =
     resolveFolderIdByTaskName(selectedProject, '野外采集') ||
@@ -649,50 +653,29 @@ const DataDrive = ({ projects = [], selectedProject, onGoToProjects, onUpdatePro
     });
 
     const deletedItems = fileSystem.filter((f) => deletedIds.has(f.id) && f.type === 'file');
-    const deletedFolders = targetItems.filter((item) => item.type === 'folder');
+    const deletedFolders = fileSystem.filter((f) => deletedIds.has(f.id) && f.type === 'folder');
+    const backendFolderDeleteRoots = deletedFolders.filter((folder) => (
+      folder.backendFolderId
+      && !deletedFolders.some((candidate) => (
+        candidate.id !== folder.id && isFolderDescendant(candidate.id, folder.id)
+      ))
+    ));
     setSuppressedDriveItemIds((prev) => {
       const next = new Set(prev);
       deletedIds.forEach((id) => next.add(String(id)));
       return next;
     });
 
-    try {
-      await setFileSystem(fileSystem.filter((entry) => !deletedIds.has(entry.id)), {
-        title: hasMttsGroup ? '测点数据已删除' : '网盘文件已删除',
-        detail: isBatch ? `已删除 ${deletedIds.size} 个网盘项目。` : hasMttsGroup ? '已删除该测点组下的全部 MTTS 文件。' : '已删除选中的文件或文件夹。',
-        nodeId: 'storage',
-        nodeName: '成果入库节点',
-        level: 'warning',
-        syncSource: 'data-drive',
-        syncTitle: hasMttsGroup ? '正在同步测点删除结果' : '正在同步网盘删除结果',
-        syncDetail: hasMttsGroup
-          ? '正在将测点文件删除结果写入项目数据库，并准备回刷测线测点树。'
-          : '正在将网盘删除结果写入项目数据库，并准备回刷测线测点树。',
-        syncedTitle: '删除结果已同步',
-        syncedDetail: '删除后的网盘数据、项目数据库和测线测点树已经保持一致。',
-        errorTitle: '删除结果同步失败'
-      });
-    } catch (error) {
-      console.warn('Failed to persist drive item delete', error);
-      setSuppressedDriveItemIds((prev) => {
-        const next = new Set(prev);
-        deletedIds.forEach((id) => next.delete(String(id)));
-        return next;
-      });
-      const detail = `项目保存失败，删除操作未能同步到后端：${error?.message || '未知错误'}`;
-      msg.error(detail);
-      showBackendSyncFeedback('error', '项目保存失败', detail);
-      return;
-    }
-
-    if (deletedFolders.length && shouldUseAdminFolders && backendProjectId) {
-      try {
-        await Promise.all(deletedFolders.map((folder) => deleteAdminFolder(folder.id, backendProjectId, currentUser)));
-        await Promise.all([refreshBackendFolders(), refreshBackendFiles()]);
-        showBackendSyncFeedback('success', '后台目录已同步', `已同步删除 ${deletedFolders.length} 个文件夹及其子内容。`);
-      } catch (error) {
-        console.warn('Failed to delete folder from backend', error);
-        showBackendSyncFeedback('warning', '后台目录同步失败', `文件夹已在当前页面删除，但后台目录删除失败：${error?.message || '未知错误'}`);
+    let folderSyncSucceeded = false;
+    let folderSyncFailed = false;
+    if (backendFolderDeleteRoots.length && shouldUseAdminFolders && backendProjectId) {
+      const folderResults = await Promise.allSettled(
+        backendFolderDeleteRoots.map((folder) => deleteAdminFolder(folder.id, backendProjectId, currentUser))
+      );
+      folderSyncSucceeded = folderResults.some((result) => result.status === 'fulfilled');
+      folderSyncFailed = folderResults.some((result) => result.status === 'rejected');
+      if (folderSyncFailed) {
+        console.warn('Failed to delete one or more folders from backend', folderResults);
       }
     }
 
@@ -740,9 +723,53 @@ const DataDrive = ({ projects = [], selectedProject, onGoToProjects, onUpdatePro
           });
         }).filter(Boolean)
       );
-      await refreshBackendFiles().catch((error) => {
-        console.warn('Failed to refresh backend files after delete', error);
+    }
+
+    try {
+      await setFileSystem(fileSystem.filter((entry) => !deletedIds.has(entry.id)), {
+        title: hasMttsGroup ? '测点数据已删除' : '网盘文件已删除',
+        detail: isBatch ? `已删除 ${deletedIds.size} 个网盘项目。` : hasMttsGroup ? '已删除该测点组下的全部 MTTS 文件。' : '已删除选中的文件或文件夹。',
+        nodeId: 'storage',
+        nodeName: '成果入库节点',
+        level: 'warning',
+        syncSource: 'data-drive',
+        syncTitle: hasMttsGroup ? '正在同步测点删除结果' : '正在同步网盘删除结果',
+        syncDetail: hasMttsGroup
+          ? '正在将测点文件删除结果写入项目数据库，并准备回刷测线测点树。'
+          : '正在将网盘删除结果写入项目数据库，并准备回刷测线测点树。',
+        syncedTitle: '删除结果已同步',
+        syncedDetail: '删除后的网盘数据、项目数据库和测线测点树已经保持一致。',
+        errorTitle: '删除结果同步失败'
       });
+    } catch (error) {
+      console.warn('Failed to persist drive item delete', error);
+      setSuppressedDriveItemIds((prev) => {
+        const next = new Set(prev);
+        deletedIds.forEach((id) => next.delete(String(id)));
+        return next;
+      });
+      const detail = `项目保存失败，删除操作未能同步到后端：${error?.message || '未知错误'}`;
+      msg.error(detail);
+      showBackendSyncFeedback('error', '项目保存失败', detail);
+      return;
+    }
+
+    if ((deletedFolders.length && shouldUseAdminFolders && backendProjectId) || (shouldLogFileOperations && backendProjectId && deletedItems.length)) {
+      await Promise.all([
+        refreshBackendFolders().catch((error) => {
+          console.warn('Failed to refresh backend folders after delete', error);
+          return [];
+        }),
+        refreshBackendFiles().catch((error) => {
+          console.warn('Failed to refresh backend files after delete', error);
+          return [];
+        })
+      ]);
+    }
+    if (folderSyncSucceeded) {
+      showBackendSyncFeedback('success', '后台目录已同步', `已同步删除 ${deletedFolders.length} 个文件夹及其子内容。`);
+    } else if (folderSyncFailed && !syncResult?.ok) {
+      showBackendSyncFeedback('warning', '后台同步失败', '文件夹已在当前页面删除，但部分后台目录或文件记录同步失败，请稍后刷新确认。');
     }
     if (syncResult?.ok) {
       showBackendSyncFeedback('success', '后台文件记录已同步', `已将 ${deletedItems.length} 个文件删除动作同步到后台 files/file_operation_logs。`);
@@ -969,6 +996,26 @@ const DataDrive = ({ projects = [], selectedProject, onGoToProjects, onUpdatePro
       instrumentType
     };
     const folderSyncedToBackend = Boolean(shouldUseAdminFolders && backendProjectId);
+    setShowFolderPrompt(false);
+
+    const persistFolderLocally = () => setFileSystem([...latestFileSystemRef.current, folder], {
+      title: '文件夹已创建',
+      detail: `已创建文件夹“${folder.name}”。`,
+      nodeId: 'storage',
+      nodeName: '成果入库节点',
+      level: 'info',
+      syncSource: 'data-drive',
+      syncTitle: '正在同步新建文件夹',
+      syncDetail: folderSyncedToBackend
+        ? '正在将后台新建目录写回项目云盘数据，并回刷当前网盘视图。'
+        : '正在将新建目录写入项目数据库，并回刷当前网盘视图。',
+      syncedTitle: '新建文件夹已同步',
+      syncedDetail: folderSyncedToBackend
+        ? '新建目录已经同步到后台目录、项目云盘数据和当前目录树。'
+        : '新建目录已经同步到网盘数据、项目数据库和当前目录树。',
+      errorTitle: '新建文件夹同步失败'
+    });
+
     if (folderSyncedToBackend) {
       try {
         await upsertAdminFolder(
@@ -996,58 +1043,33 @@ const DataDrive = ({ projects = [], selectedProject, onGoToProjects, onUpdatePro
         setBackendFeedback({
           level: 'warning',
           title: '后台目录同步失败',
-          detail: `文件夹“${folder.name}”创建失败，请检查后台目录权限或稍后重试：${error?.message || '未知错误'}`
+          detail: `文件夹“${folder.name}”未能写入后台目录树：${error?.message || '未知错误'}`
         });
         return;
       }
+    }
 
-      try {
-        await setFileSystem([...fileSystem, folder], {
-          title: '文件夹已创建',
-          detail: `已创建文件夹“${folder.name}”。`,
-          nodeId: 'storage',
-          nodeName: '成果入库节点',
-          level: 'info',
-          syncSource: 'data-drive',
-          syncTitle: '正在同步新建文件夹',
-          syncDetail: '正在将后台新建目录写回项目云盘数据，并回刷当前网盘视图。',
-          syncedTitle: '新建文件夹已同步',
-          syncedDetail: '新建目录已经同步到后台目录、项目云盘数据和当前目录树。',
-          errorTitle: '新建文件夹同步失败'
-        });
+    try {
+      await persistFolderLocally();
+      if (folderSyncedToBackend) {
         await refreshBackendFolders();
         setBackendFeedback({
           level: 'success',
           title: '后台目录已同步',
           detail: `文件夹“${folder.name}”已写入后台目录树，并同步回项目云盘数据。`
         });
-        setShowFolderPrompt(false);
-        return;
-      } catch (error) {
-        console.warn('Failed to persist backend folder to project cloud data', error);
-        msg.error(`项目保存失败，新建文件夹未能同步到项目云盘数据：${error?.message || '未知错误'}`);
-        setBackendFeedback({
-          level: 'error',
-          title: '项目云盘同步失败',
-          detail: `文件夹“${folder.name}”已写入后台目录，但项目 cloudData.items 保存失败，请刷新或重试：${error?.message || '未知错误'}`
-        });
-        return;
       }
+    } catch (error) {
+      console.warn('Failed to persist local folder to project cloud data', error);
+      msg.error(`项目保存失败，新建文件夹未能同步到项目云盘数据：${error?.message || '未知错误'}`);
+      setBackendFeedback({
+        level: 'error',
+        title: '项目云盘同步失败',
+        detail: folderSyncedToBackend
+          ? `文件夹“${folder.name}”已写入后台目录，但项目 cloudData.items 保存失败，请刷新或重试：${error?.message || '未知错误'}`
+          : `文件夹“${folder.name}”未能写入项目 cloudData.items：${error?.message || '未知错误'}`
+      });
     }
-    await setFileSystem([...fileSystem, folder], {
-      title: '文件夹已创建',
-      detail: `已创建文件夹“${folder.name}”。`,
-      nodeId: 'storage',
-      nodeName: '成果入库节点',
-      level: 'info',
-      syncSource: 'data-drive',
-      syncTitle: '正在同步新建文件夹',
-      syncDetail: '正在将新建目录写入项目数据库，并回刷当前网盘视图。',
-      syncedTitle: '新建文件夹已同步',
-      syncedDetail: '新建目录已经同步到网盘数据、项目数据库和当前目录树。',
-      errorTitle: '新建文件夹同步失败'
-    });
-    setShowFolderPrompt(false);
   };
 
   const openCreateFolderPrompt = () => {

@@ -1,4 +1,4 @@
-﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { MapContainer, Marker, Polyline, TileLayer, Tooltip, useMap, useMapEvents } from 'react-leaflet';
 import { divIcon } from 'leaflet';
 import 'leaflet/dist/leaflet.css';
@@ -437,7 +437,7 @@ const ProjectPlanningPanel = ({ project, onSave, canEdit = true, selectedDesignE
               <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                 {isDirty && (
                   <span style={{ padding: '4px 8px', borderRadius: '999px', background: '#fff7ed', color: '#ea580c', fontSize: '11px', fontWeight: 700 }}>
-                    ?????
+                    未保存
                   </span>
                 )}
                 <button onClick={handleUndo} disabled={!canEdit || !historyState.canUndo} style={{ background: '#fff', color: '#475569', border: '1px solid #cbd5e1', borderRadius: '8px', padding: '8px 10px', cursor: canEdit && historyState.canUndo ? 'pointer' : 'not-allowed', display: 'flex', alignItems: 'center', gap: '6px', ...getDisabledStyle(canEdit && historyState.canUndo) }}>
@@ -634,30 +634,29 @@ const ProjectPlanningPanel = ({ project, onSave, canEdit = true, selectedDesignE
               <input value={plan.surveyGoal} onChange={(e) => handleFieldChange('surveyGoal', e.target.value)} placeholder="例如：隧道富水异常体精细探测" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
             </div>
             <div style={cardStyle}>
-              <input value={plan.surveyScope} onChange={(e) => handleFieldChange('surveyScope', e.target.value)} placeholder="????? DK32+100 ? DK32+860" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
-              <input value={plan.surveyScope} onChange={(e) => handleFieldChange('surveyScope', e.target.value)} placeholder="????? DK32+100 ? DK32+860" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
+              <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '8px' }}>勘查范围</div>
+              <input value={plan.surveyScope} onChange={(e) => handleFieldChange('surveyScope', e.target.value)} placeholder="例如：DK32+100 至 DK32+860" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
             </div>
             <div style={cardStyle}>
-              <input value={plan.plannedLines} onChange={(e) => handleFieldChange('plannedLines', e.target.value)} placeholder="???8" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
-              <input value={plan.plannedLines} onChange={(e) => handleFieldChange('plannedLines', e.target.value)} placeholder="???8" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
+              <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '8px' }}>计划测线</div>
+              <input value={plan.plannedLines} onChange={(e) => handleFieldChange('plannedLines', e.target.value)} placeholder="例如：8" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
             </div>
             <div style={cardStyle}>
-              <input value={plan.plannedPoints} onChange={(e) => handleFieldChange('plannedPoints', e.target.value)} placeholder="???16" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
-              <input value={plan.plannedPoints} onChange={(e) => handleFieldChange('plannedPoints', e.target.value)} placeholder="???16" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
+              <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '8px' }}>计划测点</div>
+              <input value={plan.plannedPoints} onChange={(e) => handleFieldChange('plannedPoints', e.target.value)} placeholder="例如：16" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
             </div>
             <div style={cardStyle}>
-              <input value={plan.lineSpacing} onChange={(e) => handleFieldChange('lineSpacing', e.target.value)} placeholder="???20m" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
-              <input value={plan.lineSpacing} onChange={(e) => handleFieldChange('lineSpacing', e.target.value)} placeholder="???20m" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
+              <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '8px' }}>设计线距</div>
+              <input value={plan.lineSpacing} onChange={(e) => handleFieldChange('lineSpacing', e.target.value)} placeholder="例如：20m" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
             </div>
             <div style={cardStyle}>
-              <input value={plan.pointSpacing} onChange={(e) => handleFieldChange('pointSpacing', e.target.value)} placeholder="???20m" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
-              <input value={plan.pointSpacing} onChange={(e) => handleFieldChange('pointSpacing', e.target.value)} placeholder="???20m" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
+              <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '8px' }}>设计点距</div>
+              <input value={plan.pointSpacing} onChange={(e) => handleFieldChange('pointSpacing', e.target.value)} placeholder="例如：20m" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
             </div>
             <div style={cardStyle}>
               <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '8px' }}>仪器配置</div>
               <input value={plan.instrumentModel} onChange={(e) => handleFieldChange('instrumentModel', e.target.value)} placeholder="例如：EH4 + F3 联合布设" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
             </div>
-            <div style={cardStyle}>
             <div style={cardStyle}>
               <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '8px' }}>复核人</div>
               <input value={plan.reviewer} onChange={(e) => handleFieldChange('reviewer', e.target.value)} placeholder="例如：李四" style={{ ...inputStyle, ...getDisabledStyle(canEdit, 'input') }} disabled={!canEdit} />
@@ -687,9 +686,7 @@ const ProjectPlanningPanel = ({ project, onSave, canEdit = true, selectedDesignE
             <button onClick={() => savePlan(true)} disabled={!canEdit} style={{ background: '#2563eb', color: '#fff', border: 'none', borderRadius: '10px', padding: '10px 16px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600, ...getDisabledStyle(canEdit) }}>
               <CheckCircle2 size={16} /> 标记规划完成
             </button>
-          </div>
         </div>
-
       </div>
     </div>
   );

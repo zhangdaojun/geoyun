@@ -476,6 +476,14 @@ def _build_simpeg_visualization_from_npz(
         viz_mask = np.asarray(package["visualization_mask"], dtype=bool)
     else:
         viz_mask = np.isfinite(resistivity)
+    if terrain_points is None and "terrain_points" in package.files:
+        terrain_array = np.asarray(package["terrain_points"], dtype=float)
+        if terrain_array.ndim == 2 and terrain_array.shape[1] >= 2:
+            terrain_points = [
+                (float(row[0]), float(row[1]))
+                for row in terrain_array
+                if np.isfinite(row[0]) and np.isfinite(row[1])
+            ]
 
     mesh = SimpleNamespace(
         h=(hx, hz),
@@ -488,6 +496,48 @@ def _build_simpeg_visualization_from_npz(
         viz_mask,
         terrain_points=terrain_points,
     )
+
+
+def build_simpeg_preview_from_npz(
+    npz_path: str | Path,
+    *,
+    terrain_points: list[tuple[float, float]] | None = None,
+) -> dict[str, Any]:
+    import numpy as np
+
+    preview_points, mesh_node_points, simpeg_cell_grid = _build_simpeg_visualization_from_npz(
+        npz_path,
+        terrain_points=terrain_points,
+    )
+    payload: dict[str, Any] = {
+        "preview_points": preview_points,
+        "mesh_node_points": mesh_node_points,
+        "surfer_preview_points": preview_points,
+        "surfer_boundary_points": simpeg_cell_grid.get("boundary") or [],
+        "simpeg_cell_grid": simpeg_cell_grid,
+        "npz": str(npz_path),
+    }
+
+    package = np.load(Path(npz_path))
+    if {"dobs", "dpred", "standard_deviation"}.issubset(set(package.files)):
+        dobs = np.asarray(package["dobs"], dtype=float)
+        dpred = np.asarray(package["dpred"], dtype=float)
+        standard_deviation = np.asarray(package["standard_deviation"], dtype=float)
+        if dobs.size and dobs.shape == dpred.shape:
+            relative_residual = (dobs - dpred) / np.maximum(np.abs(dobs), 1e-12)
+            normalized_residual = (dobs - dpred) / np.maximum(standard_deviation, 1e-12)
+            payload["fit_comparison"] = {
+                "obs": dobs.tolist(),
+                "pred": dpred.tolist(),
+                "misfit_pct": (relative_residual * 100.0).tolist(),
+                "rms_pct": float(np.sqrt(np.mean(relative_residual**2)) * 100.0),
+                "weighted_rms": float(np.sqrt(np.mean(normalized_residual**2))),
+                "n": int(dobs.size),
+                "unit": "ohm_m",
+            }
+    if "iteration" in package.files:
+        payload["iteration"] = int(np.asarray(package["iteration"]).reshape(-1)[0])
+    return payload
 
 
 def _write_tensor_mesh_vtk(
@@ -565,7 +615,6 @@ def run_simpeg_inversion(
 
     from .pygimli_ert import (
         _collect_result_files,
-        _create_surfer_outputs_from_vtk,
         _load_terrain_points,
     )
     from .res2dinv_to_simpeg import parse_res2dinv_dat
@@ -662,12 +711,108 @@ def run_simpeg_inversion(
         # β by 32k× over 15 iterations and stalled at χ²≈18; the slower cool lets
         # TargetMisfit(chifact=1.0) kick in near the right β.
         cooling_rate = max(2, int(round(max_iter / 6))) if int(max_iter) > 6 else 2
+
+        # The iteration artifacts intentionally stay in SimPEG-native formats:
+        # a compact npz plus a plain resistivity vector. The frontend receives a
+        # cell grid derived in-memory, so intermediate results do not need VTK.
+        survey_x_values = [
+            float(getattr(d, attr))
+            for d in datums
+            for attr in ("ax", "bx", "mx", "nx")
+            if getattr(d, attr, None) is not None and math.isfinite(float(getattr(d, attr)))
+        ]
+        survey_x_min = min(survey_x_values)
+        survey_x_max = max(survey_x_values)
+        max_array_span = max(
+            (
+                abs(float(getattr(d, "bx") or 0.0) - float(getattr(d, "ax") or 0.0))
+                for d in datums
+                if getattr(d, "ax", None) is not None and getattr(d, "bx", None) is not None
+            ),
+            default=float(parsed.unit_spacing or 1.0) * 30.0,
+        )
+        sensitivity_depth = max(max_array_span / 3.0, float(parsed.unit_spacing or 1.0) * 5.0)
+        top_z = max((point[1] for point in terrain_points), default=0.0)
+        clip_z_min = top_z - sensitivity_depth
+
+        cell_centers_x = np.asarray(mesh.cell_centers[:, 0], dtype=float)
+        cell_centers_z = np.asarray(mesh.cell_centers[:, 1], dtype=float)
+        viz_mask = active_cells.copy()
+        viz_mask &= cell_centers_x >= survey_x_min
+        viz_mask &= cell_centers_x <= survey_x_max
+        viz_mask &= cell_centers_z >= clip_z_min
+
+        iteration_results: list[dict[str, Any]] = []
+        saved_iteration_indices: set[int] = set()
+
+        def save_simpeg_iteration_snapshot(iteration_index: int, active_model: Any) -> dict[str, Any] | None:
+            if iteration_index in saved_iteration_indices:
+                return None
+            active_model_array = np.asarray(active_model, dtype=float)
+            if active_model_array.size != n_active:
+                return None
+
+            full_sigma_iteration = np.asarray(model_map * active_model_array, dtype=float)
+            resistivity_iteration = 1.0 / full_sigma_iteration
+            resistivity_iteration[~active_cells] = np.nan
+
+            viz_resistivity_iteration = resistivity_iteration.copy()
+            viz_resistivity_iteration[~viz_mask] = np.nan
+            predicted_iteration = np.asarray(simulation.dpred(active_model_array), dtype=float)
+            relative_residual_iteration = (
+                (dobs - predicted_iteration) / np.maximum(np.abs(dobs), 1e-12)
+            )
+            normalized_residual_iteration = (
+                (dobs - predicted_iteration) / np.maximum(standard_deviation, 1e-12)
+            )
+
+            stem = f"iteration_{iteration_index:03d}"
+            npz_path_iter = output_path / f"{stem}.npz"
+            vector_path_iter = output_path / f"{stem}.vector"
+            np.savez(
+                npz_path_iter,
+                mesh_hx=np.asarray(mesh.h[0], dtype=float),
+                mesh_hz=np.asarray(mesh.h[1], dtype=float),
+                mesh_origin=np.asarray(mesh.origin, dtype=float),
+                recovered_log_sigma=active_model_array,
+                recovered_resistivity=resistivity_iteration,
+                visualization_resistivity=viz_resistivity_iteration,
+                visualization_mask=viz_mask,
+                terrain_points=np.asarray(terrain_points, dtype=float),
+                dobs=dobs,
+                dpred=predicted_iteration,
+                standard_deviation=standard_deviation,
+                iteration=int(iteration_index),
+            )
+            np.savetxt(vector_path_iter, resistivity_iteration)
+
+            snapshot = build_simpeg_preview_from_npz(npz_path_iter)
+            snapshot["vector"] = str(vector_path_iter)
+            snapshot["fit_comparison"] = {
+                "obs": dobs.tolist(),
+                "pred": predicted_iteration.tolist(),
+                "misfit_pct": (relative_residual_iteration * 100.0).tolist(),
+                "rms_pct": float(np.sqrt(np.mean(relative_residual_iteration**2)) * 100.0),
+                "weighted_rms": float(np.sqrt(np.mean(normalized_residual_iteration**2))),
+                "n": int(dobs.size),
+                "unit": "ohm_m",
+            }
+            saved_iteration_indices.add(iteration_index)
+            return snapshot
+
+        class SaveSimpegIterationSnapshot(directives.InversionDirective):
+            def endIter(self):  # noqa: N802 - SimPEG directive hook name
+                iteration_index = int(getattr(self.opt, "iter", len(iteration_results) + 1))
+                snapshot = save_simpeg_iteration_snapshot(iteration_index, self.opt.xc)
+                if snapshot is not None:
+                    iteration_results.append(snapshot)
         inv = inversion.BaseInversion(
             inv_problem,
             directiveList=[
                 directives.BetaEstimate_ByEig(beta0_ratio=1.0),
                 directives.BetaSchedule(coolingFactor=2.0, coolingRate=cooling_rate),
                 directives.TargetMisfit(chifact=1.0),
+                SaveSimpegIterationSnapshot(),
             ],
         )
 
@@ -726,7 +871,6 @@ def run_simpeg_inversion(
 
         npz_path = output_path / "simpeg_ert_inversion.npz"
         vector_path = output_path / "resistivity.vector"
-        vtk_path = output_path / "resistivity.vtk"
         summary_path = output_path / "summary.json"
         np.savez(
             npz_path,
@@ -737,15 +881,12 @@ def run_simpeg_inversion(
             recovered_resistivity=recovered_resistivity,
             visualization_resistivity=viz_resistivity,
             visualization_mask=viz_mask,
+            terrain_points=np.asarray(terrain_points, dtype=float),
             dobs=dobs,
             dpred=predicted,
             standard_deviation=standard_deviation,
         )
         np.savetxt(vector_path, recovered_resistivity)
-        # Write VTK as an exportable artifact (kept for ParaView / Surfer users),
-        # but the frontend visualisation no longer reads it back.
-        _write_tensor_mesh_vtk(mesh, viz_resistivity, vtk_path)
-        surfer_outputs = _create_surfer_outputs_from_vtk(vtk_path)
 
         # Build cell-centred preview / node points and a regular-grid raster
         # directly from the saved npz. The frontend can paint each cell as one
@@ -754,6 +895,7 @@ def run_simpeg_inversion(
         preview_points_npz, mesh_node_points_npz, simpeg_cell_grid = _build_simpeg_visualization_from_npz(
             npz_path, terrain_points=terrain_points
         )
+        surfer_outputs = {}
         surfer_outputs["preview_points"] = preview_points_npz
         surfer_outputs["mesh_node_points"] = mesh_node_points_npz
         surfer_outputs["surfer_preview_points"] = preview_points_npz
@@ -797,6 +939,13 @@ def run_simpeg_inversion(
         for extra_path in (npz_path, summary_path, Path(input_audit["csv"]), Path(input_audit["summary"])):
             if str(extra_path) not in files:
                 files.append(str(extra_path))
+        for iteration_result in iteration_results:
+            for key in ("npz", "vector"):
+                iteration_path = iteration_result.get(key)
+                if iteration_path and iteration_path not in files:
+                    files.append(iteration_path)
+
+        relative_misfit_pct = (relative_residual * 100.0).tolist()
 
         return {
             "status": "success",
@@ -805,6 +954,14 @@ def run_simpeg_inversion(
             "rrms": relative_rrms_percent,
             "weighted_rms": normalized_rms,
             "mean_absolute_percent_error": mean_absolute_percent_error,
+            "fit_comparison": {
+                "obs": dobs.tolist(),
+                "pred": predicted.tolist(),
+                "misfit_pct": relative_misfit_pct,
+                "rms_pct": relative_rrms_percent,
+                "n": int(survey.nD),
+                "unit": "ohm_m",
+            },
             "output_dir": str(output_path),
             "terrain_used": bool(terrain_points),
             "terrain_point_count": len(terrain_points),
@@ -822,8 +979,8 @@ def run_simpeg_inversion(
             # [x_left, z_bottom, dx, dz, rho]. Frontend should prefer this for
             # SimPEG results — paint each cell as its own rectangle (no IDW).
             "simpeg_cell_grid": surfer_outputs.get("simpeg_cell_grid"),
-            "iteration_results": [],
-            "iteration_result_count": 0,
+            "iteration_results": iteration_results,
+            "iteration_result_count": len(iteration_results),
             "files": files,
         }
     except Exception as exc:

@@ -99,10 +99,11 @@ export const useDriveBackendSync = ({
     return payload.items || [];
   };
 
-  const logFileOperations = async (operations = []) => {
+  const logFileOperations = async (operations = [], options = {}) => {
     if (!shouldLogFileOperations || !backendProjectId) return;
     const normalized = operations.filter(Boolean);
     if (!normalized.length) return;
+    const shouldRefreshAfterWrite = Boolean(options.refreshAfterWrite);
 
     try {
       const batchSize = 50;
@@ -110,7 +111,9 @@ export const useDriveBackendSync = ({
         const batch = normalized.slice(start, start + batchSize);
         await recordAdminFileOperations(batch, currentUser);
       }
-      await refreshBackendFiles();
+      if (shouldRefreshAfterWrite) {
+        await refreshBackendFiles();
+      }
       return { ok: true, total: normalized.length };
     } catch (error) {
       console.warn('Failed to record file operations', error);

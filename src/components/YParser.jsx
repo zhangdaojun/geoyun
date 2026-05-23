@@ -1,4 +1,4 @@
-﻿import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import ReactECharts from './LazyECharts';
 import { X, Maximize2, Minimize2, Activity, FileBarChart, Loader2, AlertCircle, ChevronLeft, ChevronRight, Sigma, Download } from 'lucide-react';
 import { parseYFile, parseXFile, parseZFile, parseF3TimeSeriesFile, parseMTTSFile, parseMTTSHeader, parseMTTSSegment } from '../utils/eh4io';
@@ -370,7 +370,7 @@ const YParser = ({ fileObj, fileSystem, onClose, onPrev, onNext, onSwitchType, o
 
   const buildSinglePointEmap1Payload = useCallback(async () => {
     if (!canRunSinglePointEmap1 || !currentDisplayBlock?.mttsEntries?.length) {
-      throw new Error('????????? Aurora ??? MTTS ??');
+      throw new Error('当前单点没有可用于 Aurora 计算的 MTTS 数据');
     }
     const requestedMode = String(emap1AuroraSettings.mode || 'scalar_xy').trim().toLowerCase();
     const requiredChannels = emap1RequiredChannels;
@@ -385,7 +385,7 @@ const YParser = ({ fileObj, fileSystem, onClose, onPrev, onNext, onSwitchType, o
 
     const missingChannels = requiredChannels.filter((channelName) => !entriesByChannel.has(channelName));
     if (missingChannels.length) {
-      throw new Error(`????????????${missingChannels.join(', ').toUpperCase()}`);
+      throw new Error(`缺少必要的数据通道：${missingChannels.join(', ').toUpperCase()}`);
     }
 
     const sampleCount = Number(currentDisplayBlock?.header?.length || 0)
@@ -620,9 +620,9 @@ const YParser = ({ fileObj, fileSystem, onClose, onPrev, onNext, onSwitchType, o
 
   const buildZComparisonRows = async () => {
     const zFile = resolveRelatedZFile();
-    if (!zFile) return { fileName: '', rows: [], status: 'not-found', message: '??????? Z ??' };
+    if (!zFile) return { fileName: '', rows: [], status: 'not-found', message: '未找到关联的 Z 文件' };
     const text = await resolveTextFile(zFile);
-    if (!text) return { fileName: zFile.name, rows: [], status: 'not-loaded', message: `????? ${zFile.name}??????????` };
+    if (!text) return { fileName: zFile.name, rows: [], status: 'not-loaded', message: `读取 ${zFile.name} 失败或内容为空` };
     const rows = parseZFile(text)
       .map((row) => ({
         frequency: row.freq,
@@ -647,15 +647,15 @@ const YParser = ({ fileObj, fileSystem, onClose, onPrev, onNext, onSwitchType, o
       rows,
       status: rows.length ? 'loaded' : 'empty',
       matchMode: zFile.matchMode || 'exact',
-      message: rows.length ? `??? ${rows.length} ? Z ??????` : `??? ${zFile.name}???????? Z ??`
+      message: rows.length ? `已加载 ${rows.length} 条 Z 文件电阻率数据` : `已读取 ${zFile.name}，但未解析到有效 Z 数据`
     };
   };
 
   const buildXComparisonRows = async () => {
     const xFile = resolveRelatedXFile();
-    if (!xFile) return { fileName: '', rows: [], status: 'not-found', message: '??????? X ??' };
+    if (!xFile) return { fileName: '', rows: [], status: 'not-found', message: '未找到关联的 X 文件' };
     const text = await resolveTextFile(xFile);
-    if (!text) return { fileName: xFile.name, rows: [], status: 'not-loaded', message: `????? ${xFile.name}??????????` };
+    if (!text) return { fileName: xFile.name, rows: [], status: 'not-loaded', message: `读取 ${xFile.name} 失败或内容为空` };
     const rows = parseXFile(text)
       .map((row) => ({
         freq: row.freq,
@@ -702,7 +702,7 @@ const YParser = ({ fileObj, fileSystem, onClose, onPrev, onNext, onSwitchType, o
         calibrationFileTexts,
         blocks: isF3BandFile ? allBlocks : undefined
       });
-      setEh4ComputationStage('????? Z/X ??');
+      setEh4ComputationStage('加载与对比 Z/X 文件');
       await new Promise(resolve => setTimeout(resolve, 0));
       const zComparison = await buildZComparisonRows();
       const xComparison = await buildXComparisonRows();
@@ -1537,7 +1537,8 @@ const YParser = ({ fileObj, fileSystem, onClose, onPrev, onNext, onSwitchType, o
             </div>
             {rows.length > previewRows.length && (
               <div style={{ padding: '12px 16px', color: '#64748b', fontSize: '12px' }}>
-                ???? {previewRows.length} ??? {rows.length} ??????????????????????              </div>
+                当前仅显示前 {previewRows.length} 行，共 {rows.length} 行，其余行已被隐藏。
+              </div>
             )}
           </div>
           </>

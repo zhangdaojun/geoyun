@@ -1,6 +1,6 @@
 {
   "format": "geoyun.simpeg.ert2d.input.v1",
-  "csv": "C:\\Users\\zdj\\AppData\\Local\\Temp\\geoyun_ert_inv\\283d7c7e-1f1e-44b1-8150-da1895b6cff5\\simpeg_input_abmn.csv",
+  "csv": "C:\\Users\\zdj\\AppData\\Local\\Temp\\geoyun_ert_inv\\cae31bec-f076-4591-b696-87cbebceb9e3\\simpeg_input_abmn.csv",
   "data_type": "apparent_resistivity",
   "observation_count": 287,
   "coordinate_columns": "2D SimPEG x,z electrode coordinates from RES2DINV ABMN",
