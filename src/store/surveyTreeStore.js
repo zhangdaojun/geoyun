@@ -133,7 +133,7 @@ export const useSurveyTreeStore = create((set, get) => ({
   },
 
   // 增量更新节点状态的 action
-  updateNodeStatus: (nodeId, status) => {
+  updateNodeStatus: () => {
     set((state) => {
       // 深度克隆并更新节点状态 (可以根据实际需要引入 immer，这里使用简化的对象更新)
       // 在这个版本中，我们假设在性能要求极高时才会需要真正的增量树克隆。

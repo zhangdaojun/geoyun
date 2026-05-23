@@ -11,13 +11,14 @@ function driveSelectionReducer(state, action) {
     case 'SET_VIEW_MODE':
       return { ...state, viewMode: action.payload };
     
-    case 'TOGGLE_SELECTION_MODE':
+    case 'TOGGLE_SELECTION_MODE': {
       const isEnabled = action.payload ?? !state.selectionMode;
       return {
         ...state,
         selectionMode: isEnabled,
         selectedDriveItemIds: isEnabled ? state.selectedDriveItemIds : new Set()
       };
+    }
     
     case 'TOGGLE_ITEM_SELECTION': {
       const { id } = action.payload;

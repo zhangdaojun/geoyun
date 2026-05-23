@@ -307,6 +307,7 @@ const ERTParser = ({
   const [editingCell, setEditingCell] = useState(null); // { rowIndex, colIndex }
   const [showTable, setShowTable] = useState(false); // 是否显示右侧表格
   const tableRef = useRef(null);
+  const refreshChartRef = useRef(null);
   const editedRhoRef = useRef({});                           // 事件处理函数里用，避免闭包问题
   const selectedPtRef = useRef(null);
   const wiggleParamsRef = useRef({});                        // rhoMid/rhoRange/amplitude/rowGroups
@@ -1290,42 +1291,6 @@ const ERTParser = ({
     return parsed.map(([x, y]) => ({ x, y }));
   };
 
-  const idwPreviewValue = (x, z, samples, nearestCount = 12) => {
-    const nearest = [];
-    let exactValue = null;
-    samples.forEach((sample) => {
-      if (exactValue !== null) return;
-      const distance = (sample[0] - x) ** 2 + (sample[1] - z) ** 2;
-      if (distance < 1e-18) {
-        exactValue = sample[2];
-        return;
-      }
-      if (nearest.length < nearestCount) {
-        nearest.push([distance, sample[2]]);
-        nearest.sort((a, b) => a[0] - b[0]);
-        return;
-      }
-      if (distance < nearest[nearest.length - 1][0]) {
-        nearest[nearest.length - 1] = [distance, sample[2]];
-        nearest.sort((a, b) => a[0] - b[0]);
-      }
-    });
-    if (exactValue !== null) return exactValue;
-    let weightedSum = 0;
-    let totalWeight = 0;
-    nearest.forEach(([distance, value]) => {
-      if (distance < 1e-18) {
-        weightedSum = value;
-        totalWeight = 1;
-        return;
-      }
-      const weight = 1 / Math.max(distance, 1e-18);
-      weightedSum += value * weight;
-      totalWeight += weight;
-    });
-    return totalWeight ? weightedSum / totalWeight : NaN;
-  };
-
   const buildRegularizedPreviewPoints = (points = []) => {
     const samples = (Array.isArray(points) ? points : [])
       .map((point) => [Number(point?.[0]), Number(point?.[1]), Number(point?.[2])])
@@ -1423,7 +1388,6 @@ const ERTParser = ({
     const cellXMax = Math.max(...cells.map((cell) => cell[0] + cell[2]));
     const cellZMin = Math.min(...cells.map((cell) => cell[1]));
     const cellZMax = Math.max(...cells.map((cell) => cell[1] + cell[3]));
-    const boundaryXValues = boundary.map((point) => point.x).filter(Number.isFinite);
     const boundaryYValues = boundary.map((point) => point.y).filter(Number.isFinite);
     // X 方向严格用 cell 自身边界。后端的 gridLike.x_min/x_max 早期版本里
     // 用了 hx[0]（最左 padding 单元的宽度，约为核心 dx 的 16 倍）来外扩半个
@@ -1455,7 +1419,7 @@ const ERTParser = ({
 
   const taskStorageKey = React.useMemo(
     () => makeInversionTaskStorageKey(selectedProject?.id, fileObj),
-    [selectedProject?.id, fileObj?.id, fileObj?.path, fileObj?.name]
+    [selectedProject?.id, fileObj]
   );
 
   const persistActiveInversionTask = (task) => {
@@ -1642,8 +1606,8 @@ const ERTParser = ({
     setSelectedInversionRunId(run.id);
     setSelectedInversionIterationKey('final');
     setDataType('inverted');
-    if (chartRef.current) refreshChartAfterReady(chartRef.current.getEchartsInstance(), run.data);
-    if (chartRef2.current) refreshChartAfterReady(chartRef2.current.getEchartsInstance(), run.data);
+    if (chartRef.current) refreshChartRef.current?.(chartRef.current.getEchartsInstance(), run.data);
+    if (chartRef2.current) refreshChartRef.current?.(chartRef2.current.getEchartsInstance(), run.data);
     persistActiveInversionTask({
       task_id: result?.task_id || run.id,
       status: 'success',
@@ -1703,7 +1667,7 @@ const ERTParser = ({
       if (!raw) return;
       const parsed = JSON.parse(raw);
       if (parsed?.task_id) {
-        setActiveInversionTask(parsed);
+        setActiveInversionTask(parsed); // eslint-disable-line react-hooks/set-state-in-effect
       }
     } catch (error) {
       console.warn('Failed to restore ERT inversion task state', error);
@@ -3104,19 +3068,21 @@ const ERTParser = ({
     }
   }, [schemeId, customColors, editedRho, selectedPt, isDragging, editMode, compareMode, dataType, inversionResult, currentFitComparison, directVtkMesh, directVtkCellGrid]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const refreshChartAfterReady = (inst, overrideData = null) => {
-    const apply = () => {
-      inst.resize();
-      const containerPx = getChartContainerPx(inst);
-      const opt = displayMode === 'wiggle'
-        ? getWiggleOption(maximized, customColors, containerPx, editMode, overrideData)
-        : getOption(maximized, schemeId, customColors, containerPx, editMode, overrideData);
-      inst.setOption(opt, { notMerge: true });
+  useEffect(() => {
+    refreshChartRef.current = (inst, overrideData = null) => {
+      const apply = () => {
+        inst.resize();
+        const containerPx = getChartContainerPx(inst);
+        const opt = displayMode === 'wiggle'
+          ? getWiggleOption(maximized, customColors, containerPx, editMode, overrideData)
+          : getOption(maximized, schemeId, customColors, containerPx, editMode, overrideData);
+        inst.setOption(opt, { notMerge: true });
+      };
+      apply();
+      window.requestAnimationFrame(apply);
+      [60, 160, 320].forEach((delay) => window.setTimeout(apply, delay));
     };
-    apply();
-    window.requestAnimationFrame(apply);
-    [60, 160, 320].forEach((delay) => window.setTimeout(apply, delay));
-  };
+  }, [displayMode, maximized, customColors, editMode, schemeId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const modalStyle = maximized
     ? { position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', borderRadius: 0, display: 'flex', flexDirection: 'column' }
@@ -3482,7 +3448,7 @@ const ERTParser = ({
                       notMerge={false}
                       onChartReady={(inst) => {
                         setChartReadyTick((value) => value + 1);
-                        refreshChartAfterReady(inst, compareMode ? dataPoints : null);
+                        refreshChartRef.current?.(inst, compareMode ? dataPoints : null);
                       }}
                     />
                   </div>
@@ -3501,7 +3467,7 @@ const ERTParser = ({
                       notMerge={false}
                       onChartReady={(inst) => {
                         setChartReadyTick((value) => value + 1);
-                        refreshChartAfterReady(inst, inversionResult);
+                        refreshChartRef.current?.(inst, inversionResult);
                       }}
                     />
                   </div>

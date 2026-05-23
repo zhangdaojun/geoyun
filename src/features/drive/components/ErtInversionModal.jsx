@@ -1,4 +1,4 @@
-﻿import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { X, Play, Loader, Settings2, FileText } from 'lucide-react';
 import { requestAdminApi } from '../../../services/apiClient';
 import { resolveDriveFileContent } from '../../../utils/driveFileContent';
@@ -94,7 +94,7 @@ const FitComparisonChart = ({ fit }) => {
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: '8px' }}>
         <strong style={{ fontSize: '0.95rem', color: '#0f172a' }}>观测 vs 预测 视电阻率</strong>
         <span style={{ fontSize: '0.8rem', color: '#64748b' }}>
-          数据点: {n}　·　相对偏差 RMS: {rms}%
+          数据点: {n}  ·  相对偏差 RMS: {rms}%
         </span>
       </div>
       <LazyECharts option={option} style={{ width: '100%', height: 380 }} notMerge lazyUpdate />
