@@ -258,9 +258,7 @@ export const useDriveUploadArchive = ({
 
         if (restrictedFolder?.instrumentType && !isCoordWorkbook) {
           const allowedLabel = restrictedFolder.instrumentLabel || formatRestrictedInstrumentLabel(restrictedFolder.instrumentType);
-          const matchesRestrictedInstrument = restrictedFolder.instrumentType === 'eh4-emap1'
-            ? ['eh4', 'emap1'].includes(detectedInstrumentType)
-            : detectedInstrumentType === restrictedFolder.instrumentType;
+          const matchesRestrictedInstrument = detectedInstrumentType === restrictedFolder.instrumentType;
 
           if (!detectedInstrumentType) {
             rejectedFiles.push({

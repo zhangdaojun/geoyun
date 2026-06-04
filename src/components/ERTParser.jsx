@@ -347,7 +347,7 @@ const ERTParser = ({
   }, [selectedInversionRun, selectedInversionIterationKey]);
   const inversionResult = selectedInversionIteration?.data || selectedInversionRun?.data || null;
   const currentFitComparison = selectedInversionIteration?.files?.fit_comparison || selectedInversionRun?.result?.fit_comparison || null;
-  const isDirectVtkFile = /\.(vtk)$/i.test(String(fileObj?.name || '').trim());
+  const isDirectResultFile = /\.(vtk|npz)$/i.test(String(fileObj?.name || '').trim());
 
   // 获取当前生效的数据点（原始视电阻率或反演结果）
   const activeDataPoints = React.useMemo(() => {
@@ -880,6 +880,7 @@ const ERTParser = ({
       setDataPoints(vtkData.points);
       setSelectedIndices([...Array(vtkData.points.length).keys()]);
       setLoading(false);
+      setDataType('inverted');
       return;
     }
 
@@ -1071,6 +1072,26 @@ const ERTParser = ({
       if (fileObj && typeof fileObj === 'object') {
         try {
           if (fileObj.name && fileObj.name.toLowerCase().endsWith('.npz')) {
+            const isResultNpz = /inversion|iteration/i.test(fileObj.name || '');
+            if (isResultNpz && fileObj.fileUrl) {
+              const apiPath = `${fileObj.fileUrl.replace(/^\/admin\b/, '')}/preview`;
+              const preview = await requestAdminApi(apiPath, null, { method: 'GET' }).catch(() => null);
+              if (preview && (preview.simpeg_cell_grid || Array.isArray(preview.preview_points))) {
+                dataPointsRef.current = preview.preview_points || [];
+                setFileSpacing(1.0);
+                setFileElectrodeCount(0);
+                setFileProfileLength(0);
+                setTopographyData(preview.terrain_points || null);
+                setDirectVtkCellGrid(preview.simpeg_cell_grid || null);
+                setDirectVtkMesh(preview.mesh || null);
+                setDataPoints(preview.preview_points || []);
+                setSelectedIndices([...Array((preview.preview_points || []).length).keys()]);
+                setLoading(false);
+                setDataType('inverted');
+                return;
+              }
+            }
+
             const resolved = await resolveDriveFileContent(fileObj, fileObj?.name || 'data.npz');
             if (cancelled) return;
             if (resolved instanceof File) {
@@ -2249,7 +2270,7 @@ const ERTParser = ({
       ? (custColors.length >= 2 ? custColors : DEFAULT_CUSTOM)
       : (COLOR_SCHEMES.find(s => s.id === activeSchemeId)?.colors || COLOR_SCHEMES[0].colors);
 
-    const directVtkMeshOption = (!isInvertedSource || (isDirectVtkFile && !overrideData))
+    const directVtkMeshOption = (!isInvertedSource || (isDirectResultFile && !overrideData))
       ? normalizeVtkPolygonMesh(directVtkMesh)
       : null;
     if (directVtkMeshOption) {
@@ -2286,9 +2307,9 @@ const ERTParser = ({
       if (meshOption) return meshOption;
     }
 
-    const directVtkGrid = !isInvertedSource ? normalizeSimpegCellGrid(directVtkCellGrid) : null;
+    const directVtkGrid = (!isInvertedSource || (isDirectResultFile && !overrideData)) ? normalizeSimpegCellGrid(directVtkCellGrid) : null;
     const directSimpegGrid = isInvertedSource
-      ? normalizeSimpegCellGrid(inversionPayload?.simpeg_cell_grid)
+      ? (normalizeSimpegCellGrid(inversionPayload?.simpeg_cell_grid) || directVtkGrid)
       : directVtkGrid;
     if (directSimpegGrid) {
       const cellValues = directSimpegGrid.cells.map((cell) => cell[4]).filter(Number.isFinite);

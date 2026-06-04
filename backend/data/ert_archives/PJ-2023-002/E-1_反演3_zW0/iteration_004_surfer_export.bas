@@ -11,11 +11,11 @@ Sub Main
     Dim BlankedGrid As String
     Dim OutSrf As String
 
-    InGrid = "F:\test\trae code\geoyun1\backend\data\ert_archives\PJ-2023-002\E-1_反演3_zW0\iteration_002_surfer.grd"
-    BoundaryFile = "F:\test\trae code\geoyun1\backend\data\ert_archives\PJ-2023-002\E-1_反演3_zW0\iteration_002_boundary.bln"
-    ColorFile = "F:\test\trae code\geoyun1\backend\data\ert_archives\PJ-2023-002\E-1_反演3_zW0\iteration_002_rainbow.clr"
-    BlankedGrid = "F:\test\trae code\geoyun1\backend\data\ert_archives\PJ-2023-002\E-1_反演3_zW0\iteration_002_surfer_blanked.grd"
-    OutSrf = "F:\test\trae code\geoyun1\backend\data\ert_archives\PJ-2023-002\E-1_反演3_zW0\iteration_002_surfer.srf"
+    InGrid = "F:\test\trae code\geoyun1\backend\data\ert_archives\PJ-2023-002\E-1_反演3_zW0\iteration_004_surfer.grd"
+    BoundaryFile = "F:\test\trae code\geoyun1\backend\data\ert_archives\PJ-2023-002\E-1_反演3_zW0\iteration_004_boundary.bln"
+    ColorFile = "F:\test\trae code\geoyun1\backend\data\ert_archives\PJ-2023-002\E-1_反演3_zW0\iteration_004_rainbow.clr"
+    BlankedGrid = "F:\test\trae code\geoyun1\backend\data\ert_archives\PJ-2023-002\E-1_反演3_zW0\iteration_004_surfer_blanked.grd"
+    OutSrf = "F:\test\trae code\geoyun1\backend\data\ert_archives\PJ-2023-002\E-1_反演3_zW0\iteration_004_surfer.srf"
 
     ' Try GridAssignNoData first (Surfer 16+), fallback to GridBlank (Surfer 15-)
     On Error Resume Next

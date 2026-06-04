@@ -25,12 +25,10 @@ export const normalizeInstrumentType = (instrument) => {
   const value = String(instrument || '').trim().toLowerCase();
   if (!value) return '';
   if (value.includes('f3')) return 'f3';
-  if (value.includes('eh4') && value.includes('emap')) return 'eh4-emap1';
   if (value.includes('emap')) return 'emap1';
   if (value.includes('eh4')) return 'eh4';
   if (value === 'edi' || value.includes('edi')) return 'edi';
   if (value.includes('mt')) return 'mt';
-  if (value.includes('高密度') || value.includes('电法')) return 'ert';
   if (value.includes('高密度') || value.includes('电法') || value.includes('ert')) return 'ert';
   return value;
 };
@@ -40,10 +38,8 @@ export const formatInstrumentLabel = (instrumentType, fallback = '') => {
   if (normalizedType === 'f3') return 'F3';
   if (normalizedType === 'eh4') return 'EH4';
   if (normalizedType === 'emap1') return 'EMAP-1';
-  if (normalizedType === 'eh4-emap1') return 'EH4 / EMAP-1';
   if (normalizedType === 'edi') return 'EDI';
   if (normalizedType === 'mt') return 'MT(Z/X/Y)';
-  if (normalizedType === 'ert') return '高密度电法';
   if (normalizedType === 'ert') return '高密度电法';
   return String(fallback || instrumentType || '').trim();
 };
@@ -75,14 +71,14 @@ export const classifyFileInstrument = (fileName = '') => {
   if (lowerName.endsWith('.edi')) return 'edi';
   if (lowerName.endsWith('.mt')) return 'mt';
   if ((normalizedName.startsWith('X') || normalizedName.startsWith('Y') || normalizedName.startsWith('Z')) && /\.\d{3}$/i.test(normalizedName)) return 'eh4';
-  if (/\.(dat|segy|vtk|txt|csv|xyz|grd|bln|clr|srf|bas)$/i.test(normalizedName)) return 'ert';
+  if (/\.(dat|segy|vtk|txt|csv|xyz|grd|bln|clr|srf|bas|npz)$/i.test(normalizedName)) return 'ert';
   return '';
 };
 
 export const getMappedDriveExt = (fileName = '') => {
   const parts = String(fileName || '').split('.');
   const ext = parts.length > 1 ? parts[parts.length - 1].toLowerCase() : 'unknown';
-  if (['dat', 'segy', 'vtk', 'txt', 'csv', 'grd', 'bln', 'clr', 'srf', 'bas'].includes(ext)) return 'dat';
+  if (['dat', 'segy', 'vtk', 'txt', 'csv', 'grd', 'bln', 'clr', 'srf', 'bas', 'npz'].includes(ext)) return 'dat';
   if (['edi', 'mt', 'mtts'].includes(ext)) return 'mt';
   if (isF3FileName(fileName)) return 'mt';
   if (['jpg', 'png', 'tif', 'tiff'].includes(ext)) return 'image';

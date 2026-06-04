@@ -44,7 +44,7 @@ const classifyFileInstrument = (fileName = '') => {
   if (lowerName.endsWith('.edi')) return 'edi';
   if (lowerName.endsWith('.mtts')) return 'emap1';
   if ((normalizedName.startsWith('X') || normalizedName.startsWith('Y') || normalizedName.startsWith('Z')) && /\.\d{3,4}$/i.test(normalizedName)) return 'eh4';
-  if (/\.(dat|txt|csv|xyz|vtk|segy)$/i.test(normalizedName)) return 'ert';
+  if (/\.(dat|txt|csv|xyz|vtk|segy|grd|bln|clr|srf|bas|npz)$/i.test(normalizedName)) return 'ert';
   return '';
 };
 

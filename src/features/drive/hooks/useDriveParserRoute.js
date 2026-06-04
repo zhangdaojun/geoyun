@@ -38,8 +38,8 @@ const parseMttsPointNo = (name = '') => {
 };
 
 const isErtParserFile = (name = '', ext = '') => (
-  ['dat', 'txt', 'csv', 'xyz', 'vtk', 'segy', 'grd', 'bln', 'clr', 'srf', 'bas'].includes(String(ext || '').toLowerCase())
-  || /\.(dat|txt|csv|xyz|vtk|segy|grd|bln|clr|srf|bas)$/i.test(String(name || '').trim())
+  ['dat', 'txt', 'csv', 'xyz', 'vtk', 'segy', 'grd', 'bln', 'clr', 'srf', 'bas', 'npz'].includes(String(ext || '').toLowerCase())
+  || /\.(dat|txt|csv|xyz|vtk|segy|grd|bln|clr|srf|bas|npz)$/i.test(String(name || '').trim())
 );
 
 const buildExactPointTokens = (...values) => {
